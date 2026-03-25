@@ -220,6 +220,51 @@ int main() {
         MoeConfig cfg = {16, 8, 4, 128, 256};
         total++; if (run_test("topk4  (T=16, E=8, K=4)", cfg, 1e-2f)) passed++;
     }
+    // Single token
+    {
+        MoeConfig cfg = {1, 4, 2, 64, 128};
+        total++; if (run_test("single-token (T=1, E=4)", cfg, 1e-3f)) passed++;
+    }
+    // Single expert (top-k must be 1)
+    {
+        MoeConfig cfg = {8, 1, 1, 64, 128};
+        total++; if (run_test("single-expert (T=8, E=1, K=1)", cfg, 1e-3f)) passed++;
+    }
+    // Top-K = 1 with many experts
+    {
+        MoeConfig cfg = {32, 16, 1, 128, 256};
+        total++; if (run_test("topk1  (T=32, E=16, K=1)", cfg, 1e-2f)) passed++;
+    }
+    // Wide intermediate (I >> D)
+    {
+        MoeConfig cfg = {16, 4, 2, 64, 512};
+        total++; if (run_test("wide-ffn (T=16, D=64, I=512)", cfg, 1e-2f)) passed++;
+    }
+    // Narrow intermediate (I < D)
+    {
+        MoeConfig cfg = {16, 4, 2, 256, 64};
+        total++; if (run_test("narrow-ffn (T=16, D=256, I=64)", cfg, 1e-2f)) passed++;
+    }
+    // Many experts, few tokens (some experts get 0 tokens)
+    {
+        MoeConfig cfg = {4, 16, 2, 128, 256};
+        total++; if (run_test("sparse-routing (T=4, E=16)", cfg, 1e-3f)) passed++;
+    }
+    // Many tokens, moderate experts
+    {
+        MoeConfig cfg = {128, 8, 2, 128, 256};
+        total++; if (run_test("many-tokens (T=128, E=8)", cfg, 1e-2f)) passed++;
+    }
+    // Top-K equals num experts (all experts active)
+    {
+        MoeConfig cfg = {8, 4, 4, 64, 128};
+        total++; if (run_test("full-routing (T=8, E=4, K=4)", cfg, 1e-3f)) passed++;
+    }
+    // Larger stress test
+    {
+        MoeConfig cfg = {64, 16, 2, 512, 1024};
+        total++; if (run_test("stress (T=64, E=16, D=512)", cfg, 5e-2f)) passed++;
+    }
 
     printf("\nResults: %d / %d passed\n", passed, total);
     return (passed == total) ? 0 : 1;

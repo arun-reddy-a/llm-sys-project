@@ -178,6 +178,56 @@ int main() {
         DsaConfig cfg = {4, 4, 128, 32, 256, 64, 1024};
         total++; if (run_test("large  (Q=4,H=4,Dc=128,S=256)", cfg, 1e-2f)) passed++;
     }
+    // Single query
+    {
+        DsaConfig cfg = {1, 4, 64, 16, 32, 8, 128};
+        total++; if (run_test("single-query (Q=1,H=4,S=32)", cfg, 1e-3f)) passed++;
+    }
+    // Single head
+    {
+        DsaConfig cfg = {4, 1, 64, 16, 64, 16, 256};
+        total++; if (run_test("single-head (Q=4,H=1,S=64)", cfg, 1e-3f)) passed++;
+    }
+    // Minimal S (very sparse selection)
+    {
+        DsaConfig cfg = {4, 4, 64, 16, 4, 4, 256};
+        total++; if (run_test("minimal-S (Q=4,H=4,S=4)", cfg, 1e-3f)) passed++;
+    }
+    // Large Dp relative to Dc (positional-heavy)
+    {
+        DsaConfig cfg = {4, 4, 32, 64, 64, 16, 256};
+        total++; if (run_test("pos-heavy (Dc=32,Dp=64,S=64)", cfg, 1e-3f)) passed++;
+    }
+    // Tiny Dp (almost no positional component)
+    {
+        DsaConfig cfg = {4, 4, 128, 4, 64, 16, 256};
+        total++; if (run_test("tiny-Dp (Dc=128,Dp=4,S=64)", cfg, 1e-2f)) passed++;
+    }
+    // Many heads
+    {
+        DsaConfig cfg = {4, 32, 64, 16, 64, 16, 256};
+        total++; if (run_test("many-heads (Q=4,H=32,S=64)", cfg, 1e-2f)) passed++;
+    }
+    // Many queries
+    {
+        DsaConfig cfg = {32, 4, 64, 16, 64, 16, 512};
+        total++; if (run_test("many-queries (Q=32,H=4,S=64)", cfg, 1e-2f)) passed++;
+    }
+    // S equals N (select entire cache)
+    {
+        DsaConfig cfg = {4, 4, 64, 16, 128, 16, 128};
+        total++; if (run_test("full-cache (Q=4,S=N=128)", cfg, 1e-3f)) passed++;
+    }
+    // Large KV cache, sparse selection
+    {
+        DsaConfig cfg = {4, 4, 128, 32, 128, 64, 4096};
+        total++; if (run_test("large-cache (N=4096,S=128)", cfg, 1e-2f)) passed++;
+    }
+    // Stress test
+    {
+        DsaConfig cfg = {16, 16, 128, 32, 256, 64, 2048};
+        total++; if (run_test("stress (Q=16,H=16,Dc=128,S=256)", cfg, 5e-2f)) passed++;
+    }
 
     printf("\nResults: %d / %d passed\n", passed, total);
     return (passed == total) ? 0 : 1;
