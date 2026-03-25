@@ -112,11 +112,12 @@ git push origin main
 
 ## Contribution Checklist
 
-Use this checklist before pushing:
-
-- [ ] Pulled the latest code (`git pull`)
-- [ ] Recorded baseline benchmark numbers **before** making changes
-- [ ] All correctness tests pass (`make test`)
-- [ ] Benchmark shows improvement over the baseline
-- [ ] Updated the corresponding TODO item in `README.md` as done
-- [ ] Committed with a clear, descriptive message
+- [ ] Pull the latest code (`git pull`)
+- [ ] Run correctness tests **before** making changes (`make test` — all PASS)
+- [ ] Run benchmarks **before** making changes (`make bench | tee baseline_bench.txt`)
+- [ ] Implement kernel optimisation (in ./kernels folder)
+- [ ] Run correctness tests **after** making changes (`make test` — all PASS)
+- [ ] Run benchmarks **after** making changes (`make bench` — saved new output)
+- [ ] If Benchmark shows improvement over the baseline,
+- [ ] Update the corresponding TODO item in `README.md` as done
+- [ ] Commit and push with a clear, descriptive message
