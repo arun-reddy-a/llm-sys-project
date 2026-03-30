@@ -4,6 +4,9 @@
 #include <cstdio>
 #include <cmath>
 
+#define DOT_TILE 128
+#define MAX_HEADS_PER_THREAD 8
+
 // ===================================================================
 // Kernel: KV gather – compressed
 // ===================================================================
@@ -56,8 +59,7 @@ __global__ void v_gather_kernel(const float* v_cache, const int* indices,
 }
 
 // ===================================================================
-// Kernel: dot product – compressed
-//   scores[q, h, s] += sum_d q_nope[q,h,d] * kc[q,s,d]
+// Kernel: dot product – compressed (naive, one thread per (q,h,s))
 // ===================================================================
 __global__ void dot_compressed_kernel(const float* q_nope, const float* kc,
                                       float* scores,
@@ -79,53 +81,57 @@ __global__ void dot_compressed_kernel(const float* q_nope, const float* kc,
 
 // ===================================================================
 // Kernel: tiled dot product – compressed (shared-memory over Dc)
-// Each block handles one (q, s) pair and reuses loaded kc tiles across
-// multiple heads processed by threads in the block.
+//   One block per (q, s).  Tile loop is outermost so kc tiles are
+//   loaded once into shared memory and reused across ALL heads.
+//   __syncthreads lives only in the tile loop (not the head loop),
+//   so every thread always hits the barrier.
 // ===================================================================
-__global__ void dot_compressed_tiled_kernel(const float* q_nope, const float* kc,
+__global__ void dot_compressed_tiled_kernel(const float* __restrict__ q_nope,
+                                            const float* __restrict__ kc,
                                             float* scores,
                                             int Q, int H, int S, int Dc) {
-    const int TILE = 128; // tile size along the K/V dimension
-    int bs = blockIdx.x; // block for (q, s)
+    int bs = blockIdx.x;
     int q = bs / S;
     int s = bs % S;
     if (q >= Q) return;
 
-    extern __shared__ float s_kc[]; // size TILE floats
-
+    extern __shared__ float s_tile[];
     int tid = threadIdx.x;
-    // Each thread may handle multiple heads in a strided loop
-    for (int h = tid; h < H; h += blockDim.x) {
-        float sum = 0.0f;
-        int kc_base = (q * S + s) * Dc;
-        int qnope_base = (q * H + h) * Dc;
+    int kc_base = (q * S + s) * Dc;
 
-        for (int d0 = 0; d0 < Dc; d0 += TILE) {
-            int tsize = Dc - d0;
-            if (tsize > TILE) tsize = TILE;
+    int nh = (H + (int)blockDim.x - 1) / (int)blockDim.x;
+    if (nh > MAX_HEADS_PER_THREAD) nh = MAX_HEADS_PER_THREAD;
+    float sums[MAX_HEADS_PER_THREAD];
+    for (int i = 0; i < nh; i++) sums[i] = 0.0f;
 
-            // load tile into shared memory (parallelized by threads)
-            for (int t = tid; t < tsize; t += blockDim.x) {
-                s_kc[t] = kc[kc_base + d0 + t];
+    for (int d0 = 0; d0 < Dc; d0 += DOT_TILE) {
+        int tsize = Dc - d0;
+        if (tsize > DOT_TILE) tsize = DOT_TILE;
+
+        for (int t = tid; t < tsize; t += blockDim.x)
+            s_tile[t] = kc[kc_base + d0 + t];
+        __syncthreads();
+
+        for (int hi = 0; hi < nh; hi++) {
+            int h = tid + hi * (int)blockDim.x;
+            if (h < H) {
+                int qb = (q * H + h) * Dc + d0;
+                for (int t = 0; t < tsize; ++t)
+                    sums[hi] += q_nope[qb + t] * s_tile[t];
             }
-            __syncthreads();
-
-            // compute partial dot for this tile
-            for (int t = 0; t < tsize; ++t) {
-                sum += q_nope[qnope_base + d0 + t] * s_kc[t];
-            }
-            __syncthreads();
         }
+        __syncthreads();
+    }
 
-        // write result (additive)
-        int out_idx = q * H * S + h * S + s;
-        scores[out_idx] += sum;
+    for (int hi = 0; hi < nh; hi++) {
+        int h = tid + hi * (int)blockDim.x;
+        if (h < H)
+            scores[q * H * S + h * S + s] += sums[hi];
     }
 }
 
 // ===================================================================
-// Kernel: dot product – positional
-//   scores[q, h, s] += sum_d q_pe[q,h,d] * kp[q,s,d]
+// Kernel: dot product – positional (naive, one thread per (q,h,s))
 // ===================================================================
 __global__ void dot_positional_kernel(const float* q_pe, const float* kp,
                                       float* scores,
@@ -146,105 +152,123 @@ __global__ void dot_positional_kernel(const float* q_pe, const float* kp,
 }
 
 // ===================================================================
-// Kernel: tiled dot product – positional (shared-memory over Dp)
-// Each block handles one (q, s) pair and reuses loaded kp tiles across
-// multiple heads processed by threads in the block.
+// Kernel: tiled dot product – positional (same structure as compressed)
 // ===================================================================
-__global__ void dot_positional_tiled_kernel(const float* q_pe, const float* kp,
+__global__ void dot_positional_tiled_kernel(const float* __restrict__ q_pe,
+                                            const float* __restrict__ kp,
                                             float* scores,
                                             int Q, int H, int S, int Dp) {
-    const int TILE = 64; // positional dim is often smaller
-    int bs = blockIdx.x; // block for (q, s)
+    int bs = blockIdx.x;
     int q = bs / S;
     int s = bs % S;
     if (q >= Q) return;
 
-    extern __shared__ float s_kp[]; // size TILE floats
-
+    extern __shared__ float s_tile[];
     int tid = threadIdx.x;
-    for (int h = tid; h < H; h += blockDim.x) {
-        float sum = 0.0f;
-        int kp_base = (q * S + s) * Dp;
-        int qpe_base = (q * H + h) * Dp;
+    int kp_base = (q * S + s) * Dp;
 
-        for (int d0 = 0; d0 < Dp; d0 += TILE) {
-            int tsize = Dp - d0;
-            if (tsize > TILE) tsize = TILE;
+    int nh = (H + (int)blockDim.x - 1) / (int)blockDim.x;
+    if (nh > MAX_HEADS_PER_THREAD) nh = MAX_HEADS_PER_THREAD;
+    float sums[MAX_HEADS_PER_THREAD];
+    for (int i = 0; i < nh; i++) sums[i] = 0.0f;
 
-            for (int t = tid; t < tsize; t += blockDim.x) {
-                s_kp[t] = kp[kp_base + d0 + t];
+    for (int d0 = 0; d0 < Dp; d0 += DOT_TILE) {
+        int tsize = Dp - d0;
+        if (tsize > DOT_TILE) tsize = DOT_TILE;
+
+        for (int t = tid; t < tsize; t += blockDim.x)
+            s_tile[t] = kp[kp_base + d0 + t];
+        __syncthreads();
+
+        for (int hi = 0; hi < nh; hi++) {
+            int h = tid + hi * (int)blockDim.x;
+            if (h < H) {
+                int qb = (q * H + h) * Dp + d0;
+                for (int t = 0; t < tsize; ++t)
+                    sums[hi] += q_pe[qb + t] * s_tile[t];
             }
-            __syncthreads();
-
-            for (int t = 0; t < tsize; ++t) {
-                sum += q_pe[qpe_base + d0 + t] * s_kp[t];
-            }
-            __syncthreads();
         }
+        __syncthreads();
+    }
 
-        int out_idx = q * H * S + h * S + s;
-        scores[out_idx] += sum;
+    for (int hi = 0; hi < nh; hi++) {
+        int h = tid + hi * (int)blockDim.x;
+        if (h < H)
+            scores[q * H * S + h * S + s] += sums[hi];
     }
 }
 
 // ===================================================================
-// Kernel: fused tiled dot product – compressed + positional
-// Computes scores[q,h,s] += dot(q_nope[q,h,:Dc], kc[q,s,:Dc])
-//                         + dot(q_pe[q,h,:Dp], kp[q,s,:Dp])
-// One block per (q,s). Threads in block iterate heads.
-// Uses shared memory to tile each of the Dc and Dp regions.
+// Kernel: fused tiled dot product – single concatenated (Dc+Dp) GEMM
+//   Treats the compressed and positional dimensions as one contiguous
+//   vector of length (Dc+Dp).  A single tiling loop loads tiles from
+//   kc (for d < Dc) or kp (for d >= Dc) and dots with the matching
+//   query component.  One kernel launch, one score write per (q,h,s).
 // ===================================================================
-__global__ void dot_fused_tiled_kernel(const float* q_nope, const float* q_pe,
-                                       const float* kc, const float* kp,
+__global__ void dot_fused_tiled_kernel(const float* __restrict__ q_nope,
+                                       const float* __restrict__ q_pe,
+                                       const float* __restrict__ kc,
+                                       const float* __restrict__ kp,
                                        float* scores,
                                        int Q, int H, int S, int Dc, int Dp) {
-    const int TILE_C = 128;
-    const int TILE_P = 64;
-
-    int bs = blockIdx.x; // block for (q, s)
+    int bs = blockIdx.x;
     int q = bs / S;
     int s = bs % S;
     if (q >= Q) return;
 
-    extern __shared__ float s_buf[]; // reused for kc and kp tiles
-
+    extern __shared__ float s_tile[];
     int tid = threadIdx.x;
-    for (int h = tid; h < H; h += blockDim.x) {
-        float sum = 0.0f;
-        int kc_base = (q * S + s) * Dc;
-        int qnope_base = (q * H + h) * Dc;
-        // tiled over compressed dim
-        for (int d0 = 0; d0 < Dc; d0 += TILE_C) {
-            int tsize = Dc - d0;
-            if (tsize > TILE_C) tsize = TILE_C;
-            for (int t = tid; t < tsize; t += blockDim.x) {
-                s_buf[t] = kc[kc_base + d0 + t];
-            }
-            __syncthreads();
-            for (int t = 0; t < tsize; ++t) {
-                sum += q_nope[qnope_base + d0 + t] * s_buf[t];
-            }
-            __syncthreads();
-        }
+    int qs = q * S + s;
+    int total_dim = Dc + Dp;
 
-        int kp_base = (q * S + s) * Dp;
-        int qpe_base = (q * H + h) * Dp;
-        // tiled over positional dim
-        for (int d0 = 0; d0 < Dp; d0 += TILE_P) {
-            int tsize = Dp - d0;
-            if (tsize > TILE_P) tsize = TILE_P;
-            for (int t = tid; t < tsize; t += blockDim.x) {
-                s_buf[t] = kp[kp_base + d0 + t];
-            }
-            __syncthreads();
-            for (int t = 0; t < tsize; ++t) {
-                sum += q_pe[qpe_base + d0 + t] * s_buf[t];
-            }
-            __syncthreads();
-        }
+    int nh = (H + (int)blockDim.x - 1) / (int)blockDim.x;
+    if (nh > MAX_HEADS_PER_THREAD) nh = MAX_HEADS_PER_THREAD;
+    float sums[MAX_HEADS_PER_THREAD];
+    for (int i = 0; i < nh; i++) sums[i] = 0.0f;
 
-        int out_idx = q * H * S + h * S + s;
-        scores[out_idx] += sum;
+    for (int d0 = 0; d0 < total_dim; d0 += DOT_TILE) {
+        int tsize = total_dim - d0;
+        if (tsize > DOT_TILE) tsize = DOT_TILE;
+
+        for (int t = tid; t < tsize; t += blockDim.x) {
+            int d = d0 + t;
+            s_tile[t] = (d < Dc) ? kc[qs * Dc + d]
+                                 : kp[qs * Dp + (d - Dc)];
+        }
+        __syncthreads();
+
+        bool all_compressed = (d0 + tsize <= Dc);
+        bool all_positional = (d0 >= Dc);
+
+        for (int hi = 0; hi < nh; hi++) {
+            int h = tid + hi * (int)blockDim.x;
+            if (h < H) {
+                if (all_compressed) {
+                    int qb = (q * H + h) * Dc + d0;
+                    for (int t = 0; t < tsize; ++t)
+                        sums[hi] += q_nope[qb + t] * s_tile[t];
+                } else if (all_positional) {
+                    int qb = (q * H + h) * Dp + (d0 - Dc);
+                    for (int t = 0; t < tsize; ++t)
+                        sums[hi] += q_pe[qb + t] * s_tile[t];
+                } else {
+                    for (int t = 0; t < tsize; ++t) {
+                        int d = d0 + t;
+                        float qv = (d < Dc)
+                            ? q_nope[(q * H + h) * Dc + d]
+                            : q_pe[(q * H + h) * Dp + (d - Dc)];
+                        sums[hi] += qv * s_tile[t];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int hi = 0; hi < nh; hi++) {
+        int h = tid + hi * (int)blockDim.x;
+        if (h < H)
+            scores[q * H * S + h * S + s] += sums[hi];
     }
 }
 
@@ -303,6 +327,12 @@ __global__ void scale_kernel(float* data, float scale, int n) {
 // Host wrappers
 // ===================================================================
 
+static int dot_threads(int H) {
+    int t = (H < DOT_TILE) ? DOT_TILE : ((H + 31) / 32) * 32;
+    if (t > 256) t = 256;
+    return t;
+}
+
 void dsa_kv_gather(const float* kv_cache_compressed,
                    const float* kv_cache_positional,
                    const float* v_cache,
@@ -338,55 +368,42 @@ void dsa_kv_gather(const float* kv_cache_compressed,
 
 void dsa_dot_compressed(const float* q_nope, const float* kc, float* scores,
                         const DsaConfig& cfg, cudaStream_t stream) {
-    // Launch tiled kernel: one block per (q, s), threads cover heads
     int Q = cfg.num_queries;
     int S = cfg.num_selected_kv;
     int H = cfg.num_heads;
-    int Dc = cfg.head_dim_compressed;
     int blocks = Q * S;
-    int threads = H > 0 ? (H < 256 ? H : 256) : 1;
-    size_t sharedBytes = 128 * sizeof(float); // matches TILE in tiled kernel
-    dot_compressed_tiled_kernel<<<blocks, threads, sharedBytes, stream>>>(
-        q_nope, kc, scores,
-        cfg.num_queries, cfg.num_heads, cfg.num_selected_kv,
-        cfg.head_dim_compressed);
+    int threads = dot_threads(H);
+    size_t smem = DOT_TILE * sizeof(float);
+    dot_compressed_tiled_kernel<<<blocks, threads, smem, stream>>>(
+        q_nope, kc, scores, Q, H, S, cfg.head_dim_compressed);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void dsa_dot_positional(const float* q_pe, const float* kp, float* scores,
                         const DsaConfig& cfg, cudaStream_t stream) {
-    // Launch tiled kernel: one block per (q, s), threads cover heads
     int Q = cfg.num_queries;
     int S = cfg.num_selected_kv;
     int H = cfg.num_heads;
-    int Dp = cfg.head_dim_positional;
     int blocks = Q * S;
-    int threads = H > 0 ? (H < 256 ? H : 256) : 1;
-    size_t sharedBytes = 64 * sizeof(float); // matches TILE in positional tiled kernel
-    dot_positional_tiled_kernel<<<blocks, threads, sharedBytes, stream>>>(
-        q_pe, kp, scores,
-        cfg.num_queries, cfg.num_heads, cfg.num_selected_kv,
-        cfg.head_dim_positional);
+    int threads = dot_threads(H);
+    size_t smem = DOT_TILE * sizeof(float);
+    dot_positional_tiled_kernel<<<blocks, threads, smem, stream>>>(
+        q_pe, kp, scores, Q, H, S, cfg.head_dim_positional);
     CUDA_CHECK(cudaGetLastError());
 }
 
 void dsa_dot_fused(const float* q_nope, const float* q_pe,
-                   const float* kc, const float* kp,
-                   float* scores,
-                   const DsaConfig& cfg, cudaStream_t stream) {
-    // One block per (q, s), threads cover heads
+                           const float* kc, const float* kp,
+                           float* scores,
+                           const DsaConfig& cfg, cudaStream_t stream) {
     int Q = cfg.num_queries;
     int S = cfg.num_selected_kv;
     int H = cfg.num_heads;
-    int Dc = cfg.head_dim_compressed;
-    int Dp = cfg.head_dim_positional;
     int blocks = Q * S;
-    int threads = H > 0 ? (H < 256 ? H : 256) : 1;
-    // shared memory needs to accommodate max tile size used in kernel
-    size_t sharedBytes = (128 > 64 ? 128 : 64) * sizeof(float);
-    dot_fused_tiled_kernel<<<blocks, threads, sharedBytes, stream>>>(
-        q_nope, q_pe, kc, kp, scores,
-        cfg.num_queries, cfg.num_heads, cfg.num_selected_kv,
+    int threads = dot_threads(H);
+    size_t smem = DOT_TILE * sizeof(float);
+    dot_fused_tiled_kernel<<<blocks, threads, smem, stream>>>(
+        q_nope, q_pe, kc, kp, scores, Q, H, S,
         cfg.head_dim_compressed, cfg.head_dim_positional);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -413,7 +430,7 @@ void dsa_output_proj(const float* attn, const float* v, float* output,
 }
 
 // ===================================================================
-// Full naive DSA forward pass
+// Full DSA forward pass
 // ===================================================================
 void dsa_forward(const float* q_nope, const float* q_pe,
                  const float* kv_cache_compressed,
@@ -440,7 +457,6 @@ void dsa_forward(const float* q_nope, const float* q_pe,
     DeviceBuf<float> scores(Q * H * S);
     scores.zero();
 
-    // Fused dot: compute compressed + positional contributions in one kernel
     dsa_dot_fused(q_nope, q_pe, gathered_kc.ptr, gathered_kp.ptr, scores.ptr, cfg, stream);
 
     // Scale by 1/sqrt(Dc + Dp)
