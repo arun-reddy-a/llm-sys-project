@@ -144,9 +144,9 @@ Benchmarks report min/mean/median/max latency and throughput across multiple pro
 
 Listed in order from most basic to most advanced. Each builds on the previous.
 
-1. **Shared-memory tiled GEMM** -- Replace the naive per-element GEMM with a classic 2D-tiled GEMM using shared memory to exploit data reuse within a thread block. This is the single largest improvement for compute-bound sizes.
+1. - [x] **Shared-memory tiled GEMM** -- Replace the naive per-element GEMM with a classic 2D-tiled GEMM using shared memory to exploit data reuse within a thread block. This is the single largest improvement for compute-bound sizes. (completed)
 
-2. **Fused routing pipeline** -- Merge gate-logits, softmax, and top-K selection into a single kernel. Eliminates the intermediate logit tensor write/read to DRAM.
+2. - [x] **Fused routing pipeline** -- Merge gate-logits, softmax, and top-K selection into a single kernel. Eliminates the intermediate logit tensor write/read to DRAM. (completed)
 
 3. **Single-pass token permutation** -- Replace the per-expert gather/scatter (one DRAM pass per expert) with a single upfront permutation kernel that sorts all tokens by expert assignment and computes per-expert offsets. Reduces gather/scatter from E passes to 1.
 

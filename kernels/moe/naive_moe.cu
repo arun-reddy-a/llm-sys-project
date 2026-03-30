@@ -3,6 +3,8 @@
 #include <cfloat>
 #include <cstdio>
 
+#define TILE_SIZE 16
+
 // ===================================================================
 // Kernel: gate_logits  –  logits[t, e] = dot(input[t], gate_weight[e])
 // ===================================================================
@@ -78,6 +80,68 @@ __global__ void topk_kernel(const float* probs, int* indices, float* weights,
 }
 
 // ===================================================================
+// Optimization 2: Fused gate-logits + softmax + top-K kernel
+//   One block per token. Caches input row in shared memory,
+//   computes logits in smem, then softmax + topK without DRAM roundtrip.
+// ===================================================================
+__global__ void fused_gate_kernel(const float* __restrict__ input,
+                                  const float* __restrict__ gate_weight,
+                                  int* expert_indices, float* expert_weights,
+                                  int T, int E, int D, int K) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+
+    extern __shared__ float smem[];
+    float* s_input  = smem;
+    float* s_logits = smem + D;
+
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        s_input[d] = input[t * D + d];
+    __syncthreads();
+
+    if ((int)threadIdx.x < E) {
+        int e = threadIdx.x;
+        float dot = 0.0f;
+        for (int d = 0; d < D; d++)
+            dot += s_input[d] * gate_weight[e * D + d];
+        s_logits[e] = dot;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        float mx = -FLT_MAX;
+        for (int e = 0; e < E; e++) mx = fmaxf(mx, s_logits[e]);
+        float sum = 0.0f;
+        for (int e = 0; e < E; e++) {
+            s_logits[e] = expf(s_logits[e] - mx);
+            sum += s_logits[e];
+        }
+        for (int e = 0; e < E; e++) s_logits[e] /= sum;
+
+        int*   out_idx = expert_indices + t * K;
+        float* out_wt  = expert_weights + t * K;
+        for (int k = 0; k < K; k++) {
+            out_idx[k] = -1;
+            out_wt[k]  = -FLT_MAX;
+        }
+        for (int e = 0; e < E; e++) {
+            float v = s_logits[e];
+            int min_k = 0;
+            for (int k = 1; k < K; k++)
+                if (out_wt[k] < out_wt[min_k]) min_k = k;
+            if (v > out_wt[min_k]) {
+                out_wt[min_k]  = v;
+                out_idx[min_k] = e;
+            }
+        }
+        float s = 0.0f;
+        for (int k = 0; k < K; k++) s += out_wt[k];
+        if (s > 0.0f)
+            for (int k = 0; k < K; k++) out_wt[k] /= s;
+    }
+}
+
+// ===================================================================
 // Kernel: gather tokens for a specific expert (single-thread, naive)
 // ===================================================================
 __global__ void gather_kernel(const float* input, const int* expert_indices,
@@ -132,6 +196,87 @@ __global__ void naive_gemm_bt_kernel(const float* A, const float* B,
         sum += A[row * K_ + k] * B[col * K_ + k];
     }
     C[row * N + col] = sum;
+}
+
+// ===================================================================
+// Optimization 1: Tiled GEMM  C[M,N] = A[M,K_] * B[K_,N]
+//   Uses shared memory tiles for data reuse within a thread block.
+// ===================================================================
+__global__ void tiled_gemm_kernel(const float* __restrict__ A,
+                                  const float* __restrict__ B,
+                                  float* __restrict__ C,
+                                  int M, int N, int K_) {
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum = 0.0f;
+    int numTiles = (K_ + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (int t = 0; t < numTiles; t++) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int b_row = t * TILE_SIZE + threadIdx.y;
+
+        As[threadIdx.y][threadIdx.x] = (row < M && a_col < K_)
+            ? A[row * K_ + a_col] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] = (b_row < K_ && col < N)
+            ? B[b_row * N + col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; i++)
+            sum += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
+}
+
+// ===================================================================
+// Optimization 1: Tiled transposed-B GEMM  C[M,N] = A[M,K_] * B^T
+//   B stored row-major [N, K_].  Loads B with coalesced access and
+//   stores it transposed in shared memory (with +1 padding to avoid
+//   bank conflicts).
+// ===================================================================
+__global__ void tiled_gemm_bt_kernel(const float* __restrict__ A,
+                                     const float* __restrict__ B,
+                                     float* __restrict__ C,
+                                     int M, int N, int K_) {
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE + 1];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+
+    float sum = 0.0f;
+    int numTiles = (K_ + TILE_SIZE - 1) / TILE_SIZE;
+
+    for (int t = 0; t < numTiles; t++) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        As[threadIdx.y][threadIdx.x] = (row < M && a_col < K_)
+            ? A[row * K_ + a_col] : 0.0f;
+
+        int b_row = blockIdx.x * TILE_SIZE + threadIdx.y;
+        int b_col = t * TILE_SIZE + threadIdx.x;
+        Bs[threadIdx.x][threadIdx.y] = (b_row < N && b_col < K_)
+            ? B[b_row * K_ + b_col] : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; i++)
+            sum += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+
+        __syncthreads();
+    }
+
+    if (row < M && col < N)
+        C[row * N + col] = sum;
 }
 
 // ===================================================================
@@ -199,18 +344,13 @@ void moe_gate(const float* input, const float* gate_weight,
     int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim;
     int K = cfg.top_k;
 
-    DeviceBuf<float> logits(T * E);
+    int threads = ((E + 31) / 32) * 32;
+    if (threads < 32)  threads = 32;
+    if (threads > 256) threads = 256;
+    size_t smem_bytes = (D + E) * sizeof(float);
 
-    gate_logits_kernel<<<T, E, 0, stream>>>(input, gate_weight, logits.ptr, T, E, D);
-    CUDA_CHECK(cudaGetLastError());
-
-    int threads = 256;
-    int blocks  = (T + threads - 1) / threads;
-    softmax_experts_kernel<<<blocks, threads, 0, stream>>>(logits.ptr, T, E);
-    CUDA_CHECK(cudaGetLastError());
-
-    topk_kernel<<<blocks, threads, 0, stream>>>(logits.ptr, expert_indices,
-                                                 expert_weights, T, E, K);
+    fused_gate_kernel<<<T, threads, smem_bytes, stream>>>(
+        input, gate_weight, expert_indices, expert_weights, T, E, D, K);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -227,9 +367,9 @@ void moe_gather(const float* input, const int* expert_indices,
 
 void naive_gemm(const float* A, const float* B, float* C,
                 int M, int N, int K, cudaStream_t stream) {
-    dim3 block(16, 16);
-    dim3 grid((N + 15) / 16, (M + 15) / 16);
-    naive_gemm_kernel_impl<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    tiled_gemm_kernel<<<grid, block, 0, stream>>>(A, B, C, M, N, K);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -255,7 +395,7 @@ void moe_scatter(const float* expert_out, const int* token_map,
 }
 
 // ===================================================================
-// Full naive MoE forward pass
+// Full MoE forward pass (with tiled GEMM + fused routing)
 // ===================================================================
 void moe_forward(const float* d_input, const float* d_gate_weight,
                  const float* d_w1, const float* d_w2, float* d_output,
@@ -296,9 +436,10 @@ void moe_forward(const float* d_input, const float* d_gate_weight,
         // GEMM1: gathered[count, D] * w1_e^T -> [count, 2*I]
         {
             int M_ = h_count, N_ = 2 * I, K_ = D;
-            dim3 block(16, 16);
-            dim3 grid((N_ + 15) / 16, (M_ + 15) / 16);
-            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE,
+                      (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(
                 gathered.ptr, w1_e, gemm1_out.ptr, M_, N_, K_);
             CUDA_CHECK(cudaGetLastError());
         }
@@ -316,9 +457,10 @@ void moe_forward(const float* d_input, const float* d_gate_weight,
         // GEMM2: act_out[count, I] * w2_e^T -> [count, D]
         {
             int M_ = h_count, N_ = D, K_ = I;
-            dim3 block(16, 16);
-            dim3 grid((N_ + 15) / 16, (M_ + 15) / 16);
-            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE,
+                      (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(
                 act_out.ptr, w2_e, gemm2_out.ptr, M_, N_, K_);
             CUDA_CHECK(cudaGetLastError());
         }
