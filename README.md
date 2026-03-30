@@ -166,7 +166,7 @@ Listed in order from most basic to most advanced. Each builds on the previous.
 
 1. - [x] **Shared-memory tiling for dot products** -- Tile the K/V dimension in shared memory so that each thread block reuses loaded K/V tiles across multiple query heads. Reduces global memory traffic proportional to tile reuse factor. (completed)
 
-2. **Fuse two dot products into a single GEMM** -- Concatenate `[q_nope | q_pe]` (Dc+Dp = 576 dims) and `[K_c | K_p]` along the head dimension. Yields a single 576-dim dot product per (query, kv) pair, eliminating one kernel launch and halving score-tensor DRAM traffic.
+2. - [x] **Fuse two dot products into a single GEMM** -- Concatenate `[q_nope | q_pe]` (Dc+Dp = 576 dims) and `[K_c | K_p]` along the head dimension. Yields a single 576-dim dot product per (query, kv) pair, eliminating one kernel launch and halving score-tensor DRAM traffic.
 
 3. **Batch across queries** -- Replace the per-query serial computation with a batched GEMM over all queries simultaneously (analogous to Grouped-GEMM in MoE). Enables SM packing and amortises launch overhead.
 
