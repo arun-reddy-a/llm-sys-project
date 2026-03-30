@@ -49,6 +49,13 @@ void dsa_dot_compressed(const float* q_nope, const float* kc, float* scores,
 void dsa_dot_positional(const float* q_pe, const float* kp, float* scores,
                         const DsaConfig& cfg, cudaStream_t stream = 0);
 
+// Fused dot: computes scores += dot([q_nope|q_pe], [kc|kp]) in one kernel launch.
+// This replaces two separate dot kernels and writes scores once.
+void dsa_dot_fused(const float* q_nope, const float* q_pe,
+                   const float* kc, const float* kp,
+                   float* scores,
+                   const DsaConfig& cfg, cudaStream_t stream = 0);
+
 // Softmax over the S dimension per (q, h) pair.
 //   scores   [Q, H, S]   (in-place)
 void dsa_softmax(float* scores, const DsaConfig& cfg, cudaStream_t stream = 0);
