@@ -394,21 +394,19 @@ void moe_scatter(const float* expert_out, const int* token_map,
     CUDA_CHECK(cudaGetLastError());
 }
 
-// ===================================================================
-// Full MoE forward pass (with tiled GEMM + fused routing)
-// ===================================================================
-void moe_forward(const float* d_input, const float* d_gate_weight,
-                 const float* d_w1, const float* d_w2, float* d_output,
-                 const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens;
-    int E = cfg.num_experts;
-    int D = cfg.hidden_dim;
-    int I = cfg.intermediate_dim;
+// 1. BASELINE: Naive Implementation
+void moe_forward_naive(const float* d_input, const float* d_gate_weight,
+                       const float* d_w1, const float* d_w2, float* d_output,
+                       const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    DeviceBuf<int>   expert_indices(T * cfg.top_k);
-    DeviceBuf<float> expert_weights(T * cfg.top_k);
-    moe_gate(d_input, d_gate_weight, expert_indices.ptr, expert_weights.ptr,
-             cfg, stream);
+    // --- Naive Routing ---
+    DeviceBuf<float> d_logits(T * E);
+    gate_logits_kernel<<<T, E, 0, stream>>>(d_input, d_gate_weight, d_logits.ptr, T, E, D);
+    softmax_experts_kernel<<<(T + 255) / 256, 256, 0, stream>>>(d_logits.ptr, T, E);
+    DeviceBuf<int>   expert_indices(T * K);
+    DeviceBuf<float> expert_weights(T * K);
+    topk_kernel<<<(T+255)/256, 256, 0, stream>>>(d_logits.ptr, expert_indices.ptr, expert_weights.ptr, T, E, K);
 
     CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
 
@@ -419,53 +417,115 @@ void moe_forward(const float* d_input, const float* d_gate_weight,
     DeviceBuf<float> act_out(T * I);
     DeviceBuf<float> gemm2_out(T * D);
 
-    int h_count = 0;
-
     for (int e = 0; e < E; e++) {
-        moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e,
-                   gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
-        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int),
-                                    cudaMemcpyDeviceToHost, stream));
+        moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
+        int h_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-
         if (h_count == 0) continue;
 
-        const float* w1_e = d_w1 + (size_t)e * 2 * I * D;
-        const float* w2_e = d_w2 + (size_t)e * D * I;
-
-        // GEMM1: gathered[count, D] * w1_e^T -> [count, 2*I]
+        // GEMM1: naive
         {
             int M_ = h_count, N_ = 2 * I, K_ = D;
             dim3 block(TILE_SIZE, TILE_SIZE);
-            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE,
-                      (M_ + TILE_SIZE - 1) / TILE_SIZE);
-            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(
-                gathered.ptr, w1_e, gemm1_out.ptr, M_, N_, K_);
-            CUDA_CHECK(cudaGetLastError());
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(gathered.ptr, d_w1 + (size_t)e * 2 * I * D, gemm1_out.ptr, M_, N_, K_);
         }
-
-        // SwiGLU on [count, 2*I] -> [count, I]
-        {
-            int n = h_count * I;
-            int thr = 256;
-            int blk = (n + thr - 1) / thr;
-            swiglu_strided_kernel<<<blk, thr, 0, stream>>>(
-                gemm1_out.ptr, act_out.ptr, h_count, I);
-            CUDA_CHECK(cudaGetLastError());
-        }
-
-        // GEMM2: act_out[count, I] * w2_e^T -> [count, D]
+        swiglu_strided_kernel<<<(h_count * I + 255) / 256, 256, 0, stream>>>(gemm1_out.ptr, act_out.ptr, h_count, I);
+        // GEMM2: naive
         {
             int M_ = h_count, N_ = D, K_ = I;
             dim3 block(TILE_SIZE, TILE_SIZE);
-            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE,
-                      (M_ + TILE_SIZE - 1) / TILE_SIZE);
-            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(
-                act_out.ptr, w2_e, gemm2_out.ptr, M_, N_, K_);
-            CUDA_CHECK(cudaGetLastError());
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(act_out.ptr, d_w2 + (size_t)e * D * I, gemm2_out.ptr, M_, N_, K_);
         }
-
-        moe_scatter(gemm2_out.ptr, token_map.ptr, expert_weights.ptr,
-                    expert_indices.ptr, e, d_output, h_count, cfg, stream);
+        moe_scatter(gemm2_out.ptr, token_map.ptr, expert_weights.ptr, expert_indices.ptr, e, d_output, h_count, cfg, stream);
     }
+}
+
+// 2. OPT 1: Tiled GEMM
+void moe_forward_opt1(const float* d_input, const float* d_gate_weight,
+                      const float* d_w1, const float* d_w2, float* d_output,
+                      const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    // --- Naive Routing (same as baseline) ---
+    DeviceBuf<float> d_logits(T * E);
+    gate_logits_kernel<<<T, E, 0, stream>>>(d_input, d_gate_weight, d_logits.ptr, T, E, D);
+    softmax_experts_kernel<<<(T + 255) / 256, 256, 0, stream>>>(d_logits.ptr, T, E);
+    DeviceBuf<int>   expert_indices(T * K);
+    DeviceBuf<float> expert_weights(T * K);
+    topk_kernel<<<(T+255)/256, 256, 0, stream>>>(d_logits.ptr, expert_indices.ptr, expert_weights.ptr, T, E, K);
+
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
+    DeviceBuf<float> gathered(T * D), gemm1_out(T * 2 * I), act_out(T * I), gemm2_out(T * D);
+    DeviceBuf<int> token_map(T), d_count(1);
+
+    for (int e = 0; e < E; e++) {
+        moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
+        int h_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (h_count == 0) continue;
+
+        // GEMM1: Tiled
+        {
+            int M_ = h_count, N_ = 2 * I, K_ = D;
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(gathered.ptr, d_w1 + (size_t)e * 2 * I * D, gemm1_out.ptr, M_, N_, K_);
+        }
+        swiglu_strided_kernel<<<(h_count * I + 255) / 256, 256, 0, stream>>>(gemm1_out.ptr, act_out.ptr, h_count, I);
+        // GEMM2: Tiled
+        {
+            int M_ = h_count, N_ = D, K_ = I;
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(act_out.ptr, d_w2 + (size_t)e * D * I, gemm2_out.ptr, M_, N_, K_);
+        }
+        moe_scatter(gemm2_out.ptr, token_map.ptr, expert_weights.ptr, expert_indices.ptr, e, d_output, h_count, cfg, stream);
+    }
+}
+
+// 3. OPT 2: Fused Routing + Tiled GEMM
+void moe_forward_opt2(const float* d_input, const float* d_gate_weight,
+                      const float* d_w1, const float* d_w2, float* d_output,
+                      const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    // --- Fused Routing ---
+    DeviceBuf<int>   expert_indices(T * K);
+    DeviceBuf<float> expert_weights(T * K);
+    moe_gate(d_input, d_gate_weight, expert_indices.ptr, expert_weights.ptr, cfg, stream);
+
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
+    DeviceBuf<float> gathered(T * D), gemm1_out(T * 2 * I), act_out(T * I), gemm2_out(T * D);
+    DeviceBuf<int> token_map(T), d_count(1);
+
+    for (int e = 0; e < E; e++) {
+        moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
+        int h_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (h_count == 0) continue;
+
+        {
+            int M_ = h_count, N_ = 2 * I, K_ = D;
+            dim3 block(TILE_SIZE, TILE_SIZE), grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(gathered.ptr, d_w1 + (size_t)e * 2 * I * D, gemm1_out.ptr, M_, N_, K_);
+        }
+        swiglu_strided_kernel<<<(h_count * I + 255) / 256, 256, 0, stream>>>(gemm1_out.ptr, act_out.ptr, h_count, I);
+        {
+            int M_ = h_count, N_ = D, K_ = I;
+            dim3 block(TILE_SIZE, TILE_SIZE), grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            tiled_gemm_bt_kernel<<<grid, block, 0, stream>>>(act_out.ptr, d_w2 + (size_t)e * D * I, gemm2_out.ptr, M_, N_, K_);
+        }
+        moe_scatter(gemm2_out.ptr, token_map.ptr, expert_weights.ptr, expert_indices.ptr, e, d_output, h_count, cfg, stream);
+    }
+}
+
+void moe_forward(const float* d_input, const float* d_gate_weight,
+                 const float* d_w1, const float* d_w2, float* d_output,
+                 const MoeConfig& cfg, cudaStream_t stream) {
+    moe_forward_opt2(d_input, d_gate_weight, d_w1, d_w2, d_output, cfg, stream);
 }

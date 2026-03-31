@@ -11,7 +11,9 @@ struct BenchConfig {
     MoeConfig   moe;
 };
 
-static void bench_one(const BenchConfig& bc, int warmup, int iters) {
+typedef void (*moe_fn)(const float*, const float*, const float*, const float*, float*, const MoeConfig&, cudaStream_t);
+
+static void bench_one(const char* variant_name, moe_fn func, const BenchConfig& bc, int warmup, int iters) {
     const MoeConfig& cfg = bc.moe;
     int T = cfg.num_tokens, E = cfg.num_experts;
     int D = cfg.hidden_dim, I = cfg.intermediate_dim;
@@ -42,8 +44,7 @@ static void bench_one(const BenchConfig& bc, int warmup, int iters) {
 
     // Warm-up
     for (int i = 0; i < warmup; i++) {
-        moe_forward(d_input.ptr, d_gate.ptr, d_w1.ptr, d_w2.ptr,
-                    d_output.ptr, cfg);
+        func(d_input.ptr, d_gate.ptr, d_w1.ptr, d_w2.ptr, d_output.ptr, cfg, 0);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -52,8 +53,7 @@ static void bench_one(const BenchConfig& bc, int warmup, int iters) {
     GpuTimer timer;
     for (int i = 0; i < iters; i++) {
         timer.begin();
-        moe_forward(d_input.ptr, d_gate.ptr, d_w1.ptr, d_w2.ptr,
-                    d_output.ptr, cfg);
+        func(d_input.ptr, d_gate.ptr, d_w1.ptr, d_w2.ptr, d_output.ptr, cfg, 0);
         timer.end();
         times[i] = timer.elapsed_ms();
     }
@@ -68,8 +68,8 @@ static void bench_one(const BenchConfig& bc, int warmup, int iters) {
 
     float tokens_per_sec = T / (t_mean * 1e-3f);
 
-    printf("  %-28s  %8.3f  %8.3f  %8.3f  %8.3f  %12.0f\n",
-           bc.label, t_min, t_mean, t_median, t_max, tokens_per_sec);
+    printf("  %-10s  %-28s  %8.3f  %8.3f  %12.0f\n",
+           variant_name, bc.label, t_min, t_mean, tokens_per_sec);
 }
 
 int main(int argc, char** argv) {
@@ -79,25 +79,30 @@ int main(int argc, char** argv) {
     if (argc > 1) warmup = atoi(argv[1]);
     if (argc > 2) iters  = atoi(argv[2]);
 
-    printf("=== MoE Naive Kernel Benchmark ===\n");
+    printf("=== MoE Kernel Comparison Benchmark ===\n");
     printf("    warmup=%d  iters=%d\n\n", warmup, iters);
-    printf("  %-28s  %8s  %8s  %8s  %8s  %12s\n",
-           "Config", "Min(ms)", "Mean(ms)", "Med(ms)", "Max(ms)", "Tok/s");
-    printf("  %s\n", std::string(96, '-').c_str());
+    printf("  %-10s  %-28s  %8s  %8s  %12s\n",
+           "Variant", "Config", "Min(ms)", "Mean(ms)", "Tok/s");
+    printf("  %s\n", std::string(100, '-').c_str());
 
     srand(123);
 
     BenchConfig configs[] = {
-        {"T=16,E=4,K=2,D=64,I=128",    {16,  4, 2,  64,  128}},
-        {"T=32,E=8,K=2,D=128,I=256",   {32,  8, 2, 128,  256}},
         {"T=64,E=8,K=2,D=256,I=512",   {64,  8, 2, 256,  512}},
-        {"T=128,E=8,K=2,D=256,I=512",  {128, 8, 2, 256,  512}},
-        {"T=64,E=8,K=4,D=256,I=512",   {64,  8, 4, 256,  512}},
         {"T=128,E=16,K=2,D=512,I=1024",{128,16, 2, 512, 1024}},
     };
 
+    struct { const char* name; moe_fn fn; } variants[] = {
+        {"Naive", moe_forward_naive},
+        {"Opt1",  moe_forward_opt1},
+        {"Opt2",  moe_forward_opt2},
+    };
+
     for (auto& bc : configs) {
-        bench_one(bc, warmup, iters);
+        for (auto& v : variants) {
+            bench_one(v.name, v.fn, bc, warmup, iters);
+        }
+        printf("  %s\n", std::string(100, '-').c_str());
     }
 
     printf("\n");

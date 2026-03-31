@@ -62,15 +62,25 @@ void moe_scatter(const float* expert_out, const int* token_map,
                  const MoeConfig& cfg, cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
-// Full naive MoE forward pass (host-side orchestrator)
+// MoE Forward Implementations
 // ---------------------------------------------------------------------------
 
-// Runs the complete MoE layer: gate -> per-expert gather/gemm1/swiglu/gemm2/scatter
-//   input        [T, D]
-//   gate_weight  [E, D]
-//   w1           [E, 2*I, D]  (up-projection; first I rows = gate, next I = up)
-//   w2           [E, D, I]    (down-projection)
-//   output       [T, D]
+// 1. BASELINE: Naive kernels (gate_logits -> softmax -> topk -> naive_gemm)
+void moe_forward_naive(const float* input, const float* gate_weight,
+                       const float* w1, const float* w2, float* output,
+                       const MoeConfig& cfg, cudaStream_t stream = 0);
+
+// 2. OPT 1: Tiled GEMM (Replace naive GEMM with shared-memory tiling)
+void moe_forward_opt1(const float* input, const float* gate_weight,
+                      const float* w1, const float* w2, float* output,
+                      const MoeConfig& cfg, cudaStream_t stream = 0);
+
+// 3. OPT 2: Fused Routing + Tiled GEMM (Add fused routing kernel)
+void moe_forward_opt2(const float* input, const float* gate_weight,
+                      const float* w1, const float* w2, float* output,
+                      const MoeConfig& cfg, cudaStream_t stream = 0);
+
+// Defaults to the best available implementation (Opt 2)
 void moe_forward(const float* input, const float* gate_weight,
                  const float* w1, const float* w2, float* output,
                  const MoeConfig& cfg, cudaStream_t stream = 0);
