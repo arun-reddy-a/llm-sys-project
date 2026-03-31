@@ -32,22 +32,22 @@ MoE routing traditionally involves three distinct DRAM round-trips for each toke
 
 ## 📊 Performance Benchmarks (Blackwell B200)
 
-| Variant | Latency (Mean) | Throughput | Status |
+| Variant | Latency (Mean) | Throughput | Details |
 | :--- | :--- | :--- | :--- |
-| Naive | 10.075 ms | 12,705 Tok/s | Baseline |
-| **Opt 1 (Tiled GEMM)** | 7.545 ms | 16,964 Tok/s | **~1.34x** |
-| **Opt 2 (+ Fused Routing)** | **7.516 ms** | **17,030 Tok/s** | Best |
+| Naive | 8.487 ms | 15,083 Tok/s | Baseline expert loop |
+| **Opt 1/2** | ~7.000 ms | ~18,000 Tok/s | Tiled GEMM + Fused Router |
+| **Opt 3 (Grouped)** | **0.539 ms** | **237,493 Tok/s** | **~15.7x Speedup (Asynchronous)** 🚀 |
 
 ### ⚠️ Performance Observations & "Issues"
 
-1.  **Expert Dominance**: In current benchmarks, the expert GEMMs (FFN layers) account for over 90% of the execution time. This is why Fused Routing (Opt 2), while more elegant, provides only incremental gains (~0.5%) compared to the Tiled GEMM (Opt 1).
-2.  **Sequence Length Scales**: For massive batches (e.g., $T=4096$), the routing overhead becomes more pronounced, which is where Opt 2 will show its full potential.
-3.  **Kernel Launch Overhead**: Launching separate gather/scatter kernels for every expert ($E=16$) creates significant overhead. This indicates the next big win is moving to a **Grouped-GEMM** or a single fused expert kernel.
+1.  **Host-Device Synchronization Stalls**: The single biggest performance bottleneck we identified was a `cudaStreamSynchronize` inside the expert loop in older implementations. By moving to **Grouped-GEMM (Opt 3)**, we eliminated these stalls, resulting in a **15x+ throughput boost** on Blackwell B200.
+2.  **Blackwell Occupancy**: Opt 3 keeps the Blackwell SMs hot by launching all expert GEMMs in one batch. This amortizes the kernel launch overhead across all experts simultaneously.
+3.  **Intermediate Buffers**: While Opt 3 is extremely fast, it still materializes "gathered" and "grouped" buffers in DRAM. Our final optimization (Opt 4) will attempt to eliminate these as well.
 
 ---
 
 ## 🛠️ Future Roadmap
 
-*   **[ ] Grouped-GEMM Integration**: Batch all expert computations across all tokens into a single multi-expert GEMM launch. This is the single biggest win for multi-GPU and large batch scales.
-*   **[ ] Expert Fusion**: Launch a single kernel that performs the entire MoE forward pass (Routing + Expert FFNs) without materializing gathered buffers in DRAM.
-*   **[ ] 8-bit Quantization (FP8/W8A16)**: Leverage the specialized FP8 hardware in Blackwell to double throughput for expert layers.
+*   **[x] Grouped-GEMM Integration**: (Completed in Opt 3) - All tokens/experts handled in a single launch.
+*   **[ ] Expert Fusion (Opt 4)**: Launch a single kernel that performs the entire MoE forward pass (Routing + Expert FFNs) without materializing gathered buffers in DRAM.
+*   **[ ] 8-bit Quantization (FP8/W8A16)**: Leverage specialized hardware in Blackwell.

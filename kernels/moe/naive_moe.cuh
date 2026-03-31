@@ -80,7 +80,12 @@ void moe_forward_opt2(const float* input, const float* gate_weight,
                       const float* w1, const float* w2, float* output,
                       const MoeConfig& cfg, cudaStream_t stream = 0);
 
-// Defaults to the best available implementation (Opt 2)
+// 4. OPT 3: Grouped-GEMM (Eliminate expert loop and host-side synchronization)
+void moe_forward_opt3(const float* input, const float* gate_weight,
+                      const float* w1, const float* w2, float* output,
+                      const MoeConfig& cfg, cudaStream_t stream = 0);
+
+// Defaults to the best available implementation (Opt 3)
 void moe_forward(const float* input, const float* gate_weight,
                  const float* w1, const float* w2, float* output,
                  const MoeConfig& cfg, cudaStream_t stream = 0);

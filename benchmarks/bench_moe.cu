@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
         {"Naive", moe_forward_naive},
         {"Opt1",  moe_forward_opt1},
         {"Opt2",  moe_forward_opt2},
+        {"Opt3",  moe_forward_opt3},
     };
 
     for (auto& bc : configs) {
