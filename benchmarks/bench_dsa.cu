@@ -25,7 +25,9 @@ static void gen_sparse_indices(int* indices, int Q, int S, int N) {
     }
 }
 
-static void bench_one(const BenchConfig& bc, int warmup, int iters) {
+typedef void (*dsa_fn)(const float*, const float*, const float*, const float*, const float*, const int*, float*, const DsaConfig&, cudaStream_t);
+
+static void bench_one(const char* variant_name, dsa_fn func, const BenchConfig& bc, int warmup, int iters) {
     const DsaConfig& cfg = bc.dsa;
     int Q  = cfg.num_queries;
     int H  = cfg.num_heads;
@@ -65,8 +67,8 @@ static void bench_one(const BenchConfig& bc, int warmup, int iters) {
 
     // Warm-up
     for (int i = 0; i < warmup; i++) {
-        dsa_forward(d_q_nope.ptr, d_q_pe.ptr, d_kv_c.ptr, d_kv_p.ptr,
-                    d_v.ptr, d_idx.ptr, d_output.ptr, cfg);
+        func(d_q_nope.ptr, d_q_pe.ptr, d_kv_c.ptr, d_kv_p.ptr,
+             d_v.ptr, d_idx.ptr, d_output.ptr, cfg, 0);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -75,24 +77,22 @@ static void bench_one(const BenchConfig& bc, int warmup, int iters) {
     GpuTimer timer;
     for (int i = 0; i < iters; i++) {
         timer.begin();
-        dsa_forward(d_q_nope.ptr, d_q_pe.ptr, d_kv_c.ptr, d_kv_p.ptr,
-                    d_v.ptr, d_idx.ptr, d_output.ptr, cfg);
+        func(d_q_nope.ptr, d_q_pe.ptr, d_kv_c.ptr, d_kv_p.ptr,
+             d_v.ptr, d_idx.ptr, d_output.ptr, cfg, 0);
         timer.end();
         times[i] = timer.elapsed_ms();
     }
 
     std::sort(times.begin(), times.end());
     float t_min    = times.front();
-    float t_max    = times.back();
-    float t_median = times[iters / 2];
     float t_mean   = 0.0f;
     for (float t : times) t_mean += t;
     t_mean /= iters;
 
     float queries_per_sec = Q / (t_mean * 1e-3f);
 
-    printf("  %-40s  %8.3f  %8.3f  %8.3f  %8.3f  %12.0f\n",
-           bc.label, t_min, t_mean, t_median, t_max, queries_per_sec);
+    printf("  %-10s  %-40s  %8.3f  %8.3f  %12.0f\n",
+           variant_name, bc.label, t_min, t_mean, queries_per_sec);
 }
 
 int main(int argc, char** argv) {
@@ -102,31 +102,33 @@ int main(int argc, char** argv) {
     if (argc > 1) warmup = atoi(argv[1]);
     if (argc > 2) iters  = atoi(argv[2]);
 
-    printf("=== DSA Naive Kernel Benchmark ===\n");
+    printf("=== DSA Kernel Comparison Benchmark ===\n");
     printf("    warmup=%d  iters=%d\n\n", warmup, iters);
-    printf("  %-40s  %8s  %8s  %8s  %8s  %12s\n",
-           "Config", "Min(ms)", "Mean(ms)", "Med(ms)", "Max(ms)", "Q/s");
-    printf("  %s\n", std::string(108, '-').c_str());
+    printf("  %-10s  %-40s  %8s  %8s  %12s\n",
+           "Variant", "Config", "Min(ms)", "Mean(ms)", "Q/s");
+    printf("  %s\n", std::string(115, '-').c_str());
 
     srand(123);
 
     BenchConfig configs[] = {
-        {"Q=4,H=4,Dc=64,Dp=16,S=64,N=256",
-         {4, 4, 64, 16, 64, 16, 256}},
-        {"Q=8,H=8,Dc=128,Dp=32,S=128,N=512",
-         {8, 8, 128, 32, 128, 32, 512}},
-        {"Q=16,H=8,Dc=128,Dp=32,S=256,N=1024",
-         {16, 8, 128, 32, 256, 64, 1024}},
         {"Q=8,H=16,Dc=256,Dp=64,S=256,N=2048",
          {8, 16, 256, 64, 256, 64, 2048}},
-        {"Q=4,H=16,Dc=512,Dp=64,S=512,N=4096",
-         {4, 16, 512, 64, 512, 64, 4096}},
         {"Q=8,H=16,Dc=512,Dp=64,S=1024,N=8192",
          {8, 16, 512, 64, 1024, 64, 8192}},
     };
 
+    struct { const char* name; dsa_fn fn; } variants[] = {
+        {"Naive", dsa_forward_naive},
+        {"Opt1",  dsa_forward_opt1},
+        {"Opt2",  dsa_forward_opt2},
+        {"Opt3",  dsa_forward_opt3},
+    };
+
     for (auto& bc : configs) {
-        bench_one(bc, warmup, iters);
+        for (auto& v : variants) {
+            bench_one(v.name, v.fn, bc, warmup, iters);
+        }
+        printf("  %s\n", std::string(115, '-').c_str());
     }
 
     printf("\n");

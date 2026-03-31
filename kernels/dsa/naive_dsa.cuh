@@ -68,16 +68,46 @@ void dsa_output_proj(const float* attn, const float* v, float* output,
                      const DsaConfig& cfg, cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
-// Full naive DSA forward pass (host-side orchestrator)
+// DSA Forward Implementations
 // ---------------------------------------------------------------------------
 
-//   q_nope               [Q, H, Dc]
-//   q_pe                 [Q, H, Dp]
-//   kv_cache_compressed  [N, Dc]
-//   kv_cache_positional  [N, Dp]
-//   v_cache              [N, Dc]
-//   sparse_indices       [Q, S]
-//   output               [Q, H, Dc]
+// 1. BASELINE: Naive kernels (gate_logits -> softmax -> topk -> naive_gemm)
+void dsa_forward_naive(const float* q_nope, const float* q_pe,
+                       const float* kv_cache_compressed,
+                       const float* kv_cache_positional,
+                       const float* v_cache,
+                       const int* sparse_indices,
+                       float* output,
+                       const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// 2. OPT 1: Tiled Dot Products (Replace naive dot with shared-memory tiling)
+void dsa_forward_opt1(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// 3. OPT 2: Fused Tiled Dot Products (Fuse compressed and positional into one GEMM)
+void dsa_forward_opt2(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// 4. OPT 3: Flash Fusion (Fuse gather + dot + softmax + output calculation into one kernel)
+void dsa_forward_opt3(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// Defaults to the best available implementation (Opt 3)
 void dsa_forward(const float* q_nope, const float* q_pe,
                  const float* kv_cache_compressed,
                  const float* kv_cache_positional,
