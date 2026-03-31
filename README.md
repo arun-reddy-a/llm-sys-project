@@ -35,6 +35,21 @@ make bench_dsa
 make clean
 ```
 
+## ☁️ Modal Cloud Execution
+
+You can build and run this project on cloud GPUs using [Modal](https://modal.com). This is the recommended way to benchmark on the latest **Blackwell B200** GPUs.
+
+```bash
+# 1. Install and setup Modal
+pip install modal
+modal setup
+
+# 2. Run all tests and benchmarks on a Blackwell B200
+modal run modal_run.py
+```
+
+See [docs/modal/README.md](docs/modal/README.md) for more details.
+
 If you need to target a specific architecture (e.g. cross-compiling or `-arch=native` is not available), override `NVCC_FLAGS`:
 
 ```bash
