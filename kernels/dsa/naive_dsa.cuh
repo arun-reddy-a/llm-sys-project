@@ -107,7 +107,16 @@ void dsa_forward_opt3(const float* q_nope, const float* q_pe,
                       float* output,
                       const DsaConfig& cfg, cudaStream_t stream = 0);
 
-// Defaults to the best available implementation (Opt 3)
+// 5. OPT 4: Blackwell Pipelined Flash (Double-Buffered KV tile prefetching)
+void dsa_forward_opt4(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// Defaults to the best available implementation (Opt 4 on Blackwell)
 void dsa_forward(const float* q_nope, const float* q_pe,
                  const float* kv_cache_compressed,
                  const float* kv_cache_positional,

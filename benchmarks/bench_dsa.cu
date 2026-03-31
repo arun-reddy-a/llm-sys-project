@@ -122,6 +122,7 @@ int main(int argc, char** argv) {
         {"Opt1",  dsa_forward_opt1},
         {"Opt2",  dsa_forward_opt2},
         {"Opt3",  dsa_forward_opt3},
+        {"Opt4",  dsa_forward_opt4},
     };
 
     for (auto& bc : configs) {

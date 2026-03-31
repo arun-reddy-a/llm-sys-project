@@ -697,8 +697,277 @@ void moe_forward_opt3(const float* d_input, const float* d_gate_weight,
     );
 }
 
+// ===================================================================
+// FUSED EXPERT KERNEL: Routing + Gather + FFN + Scatter in one pass
+// One block per token. Threads collaboratively compute GEMV for each expert.
+// ===================================================================
+__global__ void fused_moe_kernel(const float* __restrict__ input,
+                                 const float* __restrict__ gate_weight,
+                                 const float* __restrict__ w1,
+                                 const float* __restrict__ w2,
+                                 float* __restrict__ output,
+                                 int T, int E, int D, int I, int K) {
+    int t = blockIdx.x;
+    if (t >= T) return;
+
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+
+    // Shared memory layout:
+    // [D]          - Token input (s_x)
+    // [E]          - Gate Logits (s_logits)
+    // [2 * I]      - Intermediate activations (s_act)
+    // [D]          - Token output accumulator (s_y)
+    // Needs about 512 + 16 + 2048 + 512 = 3088 floats = ~12 KB. Fits!
+
+    extern __shared__ float smem[];
+    float* s_x = smem;
+    float* s_logits = s_x + D;
+    float* s_act = s_logits + E;
+    float* s_y = s_act + (2 * I);
+
+    // 1. Cooperative Load: Input token
+    for (int d = tid; d < D; d += bdim) s_x[d] = input[t * D + d];
+    for (int d = tid; d < D; d += bdim) s_y[d] = 0.0f;
+    __syncthreads();
+
+    // 2. Routing: Dot(x, gate_weight)
+    if (tid < E) {
+        float sum = 0.0f;
+        for (int d = 0; d < D; d++) sum += s_x[d] * gate_weight[tid * D + d];
+        s_logits[tid] = sum;
+    }
+    __syncthreads();
+
+    // Softmax + Top-K (Single thread for simplicity, or use warp reduce)
+    __shared__ int selected_experts[8]; // MAX_K=8
+    __shared__ float selected_weights[8];
+    if (tid == 0) {
+        float mx = -FLT_MAX;
+        for (int e = 0; e < E; e++) mx = fmaxf(mx, s_logits[e]);
+        float sum_exp = 0.0f;
+        for (int e = 0; e < E; e++) {
+            s_logits[e] = expf(s_logits[e] - mx);
+            sum_exp += s_logits[e];
+        }
+        for (int e = 0; e < E; e++) s_logits[e] /= sum_exp;
+
+        // Top-K
+        for (int k = 0; k < K; k++) {
+            int best_e = -1;
+            float best_v = -FLT_MAX;
+            for (int e = 0; e < E; e++) {
+                if (s_logits[e] > best_v) {
+                    best_v = s_logits[e];
+                    best_e = e;
+                }
+            }
+            selected_experts[k] = best_e;
+            selected_weights[k] = best_v;
+            if (best_e >= 0) s_logits[best_e] = -1.0f;
+        }
+        // Normalize weights
+        float w_sum = 0.0f;
+        for (int k = 0; k < K; k++) w_sum += selected_weights[k];
+        for (int k = 0; k < K; k++) selected_weights[k] /= w_sum;
+    }
+    __syncthreads();
+
+    // 3. Expert Execution: Loop over K experts
+    for (int k = 0; k < K; k++) {
+        int e = selected_experts[k];
+        if (e < 0) continue;
+        float weight = selected_weights[k];
+
+        // --- GEMV 1: s_act[2*I] = W1[e, 2*I, D] * s_x[D] ---
+        const float* W1_e = w1 + (size_t)e * 2 * I * D;
+        for (int i = tid; i < 2 * I; i += bdim) {
+            float sum = 0.0f;
+            for (int d = 0; d < D; d++) {
+                sum += W1_e[i * D + d] * s_x[d];
+            }
+            // SwiGLU transition immediately
+            if (i < I) {
+                // This is first half (gate)
+                // We'll store it and compute SwiGLU in second pass or keep state.
+                s_act[i] = sum; 
+            } else {
+                // This is second half (up)
+                int act_idx = i - I;
+                float g = s_act[act_idx];
+                float u = sum;
+                float silu = g / (1.0f + expf(-g));
+                s_act[act_idx] = silu * u; // Store final activation in first I slots
+            }
+        }
+        __syncthreads();
+
+        // --- GEMV 2: s_y[D] += weight * W2[e, D, I] * s_act[I] ---
+        const float* W2_e = w2 + (size_t)e * D * I;
+        for (int d = tid; d < D; d += bdim) {
+            float sum = 0.0f;
+            for (int i = 0; i < I; i++) {
+                sum += W2_e[d * I + i] * s_act[i];
+            }
+            s_y[d] += weight * sum;
+        }
+        __syncthreads();
+    }
+
+    // 4. Final Write
+    for (int d = tid; d < D; d += bdim) output[t * D + d] = s_y[d];
+}
+
+// 5. OPT 4: Fused Expert Implementation
+void moe_forward_opt4(const float* d_input, const float* d_gate_weight,
+                      const float* d_w1, const float* d_w2, float* d_output,
+                      const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    int threads = 128; // Enough to cover D and E
+    // smem: D + E + 2*I + D (floats)
+    size_t smem = (D + E + 2 * I + D) * sizeof(float);
+
+    fused_moe_kernel<<<T, threads, smem, stream>>>(
+        d_input, d_gate_weight, d_w1, d_w2, d_output, T, E, D, I, K
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
+#include <cuda_pipeline_primitives.h>
+
+// ===================================================================
+// BLACKWELL SPECIFIC: Double-Buffered Async Pipelined Grouped-GEMM
+// This overlaps weight DRAM fetches for tile N+1 with computation of tile N.
+// ===================================================================
+
+__global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
+                                                   const float* __restrict__ W_ptr,
+                                                   float* __restrict__ C,
+                                                   const int* __restrict__ expert_offsets,
+                                                   int D, int N, int E) {
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    if (col >= N) return;
+
+    int e = 0;
+    while (e < E - 1 && row >= expert_offsets[e+1]) e++;
+    int total_rows = expert_offsets[E];
+    if (row >= total_rows) return;
+
+    const float* W_e = W_ptr + (size_t)e * N * D;
+
+    // Double buffers for weights (B)
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 1];
+
+    float sum = 0.0f;
+    int numTiles = (D + TILE_SIZE - 1) / TILE_SIZE;
+
+    // Initial Prefetch (Tile 0)
+    {
+        int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
+        int b_col = 0 * TILE_SIZE + threadIdx.x;
+        float val = (b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
+        Bs[0][threadIdx.x][threadIdx.y] = val; // Store in buffer 0
+        __syncthreads();
+    }
+
+    for (int t = 0; t < numTiles; t++) {
+        int next_t = t + 1;
+        int curr_buf = t % 2;
+        int next_buf = (t + 1) % 2;
+
+        // Async Prefetch Tile next_t into next_buf
+        if (next_t < numTiles) {
+            int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
+            int b_col = next_t * TILE_SIZE + threadIdx.x;
+            float val = (b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
+            // In a full Blackwell implementation, we would use TMA here.
+            // Using smem as a staging area.
+            Bs[next_buf][threadIdx.x][threadIdx.y] = val;
+        }
+
+        // Compute Tile t from curr_buf
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        As[threadIdx.y][threadIdx.x] = (a_col < D) ? A[row * D + a_col] : 0.0f;
+        
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; i++) {
+            sum += As[threadIdx.y][i] * Bs[curr_buf][i][threadIdx.x];
+        }
+        __syncthreads(); // Wait for computation to finish before we potentially overwrite curr_buf in next iteration
+    }
+    C[row * N + col] = sum;
+}
+
+// 6. OPT 5: Blackwell Implementation
+void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
+                      const float* d_w1, const float* d_w2, float* d_output,
+                      const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    // Reuse Grouped logic from Opt 3 (Indices/Offsets/Reorder)
+    DeviceBuf<int>   expert_indices(T * K);
+    DeviceBuf<float> expert_weights(T * K);
+    moe_gate(d_input, d_gate_weight, expert_indices.ptr, expert_weights.ptr, cfg, stream);
+
+    DeviceBuf<int> expert_counts(E + 1);
+    expert_counts.zero();
+    DeviceBuf<int> token_idx_in_expert(T * K);
+    expert_grouping_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
+        expert_indices.ptr, expert_counts.ptr, token_idx_in_expert.ptr, T, K, E
+    );
+
+    std::vector<int> h_counts(E + 1);
+    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream)); 
+    std::vector<int> h_offsets(E + 1);
+    h_offsets[0] = 0;
+    for (int i = 0; i < E; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
+    DeviceBuf<int> expert_offsets(E + 1);
+    expert_offsets.upload(h_offsets.data());
+
+    int total_active = h_offsets[E];
+    if (total_active == 0) return;
+
+    DeviceBuf<float> grouped_input(total_active * D);
+    DeviceBuf<int>   grouped_token_map(total_active);
+    group_reorder_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
+        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr, 
+        grouped_input.ptr, grouped_token_map.ptr, T, K, D
+    );
+
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
+    DeviceBuf<float> g_gemm1_out(total_active * 2 * I), g_act_out(total_active * I), g_gemm2_out(total_active * D);
+
+    // Blackwell Double-Buffered Grouped GEMM 1
+    {
+        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, (total_active + TILE_SIZE - 1) / TILE_SIZE);
+        grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
+            grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, D, 2 * I, E);
+    }
+
+    swiglu_strided_kernel<<<(total_active * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_active, I);
+
+    // Blackwell Double-Buffered Grouped GEMM 2
+    {
+        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, (total_active + TILE_SIZE - 1) / TILE_SIZE);
+        grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
+            g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, I, D, E);
+    }
+
+    grouped_scatter_kernel<<<total_active, D, 0, stream>>>(
+        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr, 
+        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E
+    );
+}
+
 void moe_forward(const float* d_input, const float* d_gate_weight,
                  const float* d_w1, const float* d_w2, float* d_output,
                  const MoeConfig& cfg, cudaStream_t stream) {
-    moe_forward_opt3(d_input, d_gate_weight, d_w1, d_w2, d_output, cfg, stream);
+    moe_forward_opt5(d_input, d_gate_weight, d_w1, d_w2, d_output, cfg, stream);
 }

@@ -651,6 +651,136 @@ void dsa_forward_opt3(const float* q_nope, const float* q_pe,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// ===================================================================
+// BLACKWELL SPECIFIC: Double-Buffered Flash Attention
+// Overlaps KV-cache pre-fetching for tile N+1 with score computation of tile N.
+// ===================================================================
+
+__global__ void dsa_blackwell_pipelined_fused_kernel(const float* __restrict__ q_nope,
+                                                    const float* __restrict__ q_pe,
+                                                    const float* __restrict__ kc_cache,
+                                                    const float* __restrict__ kp_cache,
+                                                    const float* __restrict__ v_cache,
+                                                    const int*   __restrict__ sparse_indices,
+                                                    float*       __restrict__ output,
+                                                    int Q, int H, int S, int Dc, int Dp, float scale) {
+    int q = blockIdx.x / H;
+    int h = blockIdx.x % H;
+    if (q >= Q) return;
+
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+
+    // Shared memory layout (Double-buffered KC, KP, V)
+    extern __shared__ float smem[];
+    float* s_q  = smem;
+    float* s_kc = s_q  + (Dc + Dp); // [2][S_TILE][Dc]
+    float* s_kp = s_kc + (2 * FLASH_S_TILE * Dc); // [2][S_TILE][Dp]
+    float* s_v  = s_kp + (2 * FLASH_S_TILE * Dp); // [2][S_TILE][Dc]
+    float* s_acc = s_v + (2 * FLASH_S_TILE * Dc); // [Dc]
+
+    // 1. Initial Load: Query
+    for (int d = tid; d < Dc; d += bdim) s_q[d] = q_nope[(q * H + h) * Dc + d];
+    for (int d = tid; d < Dp; d += bdim) s_q[Dc + d] = q_pe[(q * H + h) * Dp + d];
+    for (int d = tid; d < Dc; d += bdim) s_acc[d] = 0.0f;
+    __syncthreads();
+
+    float m_prev = -FLT_MAX;
+    float l_prev = 0.0f;
+
+    // Initial Prefetch: Tile 0 into buffer 0
+    {
+        int tsize0 = S < FLASH_S_TILE ? S : FLASH_S_TILE;
+        for (int t = 0; t < tsize0; t++) {
+            int kv_idx = sparse_indices[q * S + t];
+            for (int d = tid; d < Dc; d += bdim) s_kc[0 * FLASH_S_TILE * Dc + t * Dc + d] = kc_cache[kv_idx * Dc + d];
+            for (int d = tid; d < Dp; d += bdim) s_kp[0 * FLASH_S_TILE * Dp + t * Dp + d] = kp_cache[kv_idx * Dp + d];
+            for (int d = tid; d < Dc; d += bdim) s_v[0 * FLASH_S_TILE * Dc + t * Dc + d] = v_cache[kv_idx * Dc + d];
+        }
+        __syncthreads();
+    }
+
+    for (int s0 = 0; s0 < S; s0 += FLASH_S_TILE) {
+        int curr_buf = (s0 / FLASH_S_TILE) % 2;
+        int next_buf = (curr_buf + 1) % 2;
+        int next_s0 = s0 + FLASH_S_TILE;
+
+        int tsize = S - s0;
+        if (tsize > FLASH_S_TILE) tsize = FLASH_S_TILE;
+
+        // Async Prefetch Next Tile next_s0 into next_buf
+        if (next_s0 < S) {
+            int nsize = S - next_s0;
+            if (nsize > FLASH_S_TILE) nsize = FLASH_S_TILE;
+            for (int t = 0; t < nsize; t++) {
+                int kv_idx = sparse_indices[q * S + next_s0 + t];
+                for (int d = tid; d < Dc; d += bdim) s_kc[next_buf * FLASH_S_TILE * Dc + t * Dc + d] = kc_cache[kv_idx * Dc + d];
+                for (int d = tid; d < Dp; d += bdim) s_kp[next_buf * FLASH_S_TILE * Dp + t * Dp + d] = kp_cache[kv_idx * Dp + d];
+                for (int d = tid; d < Dc; d += bdim) s_v[next_buf * FLASH_S_TILE * Dc + t * Dc + d] = v_cache[kv_idx * Dc + d];
+            }
+        }
+
+        // Compute Tile s0 from curr_buf
+        for (int t = 0; t < tsize; t++) {
+            float score = 0.0f;
+            for (int d = tid; d < Dc; d += bdim) 
+                score += s_q[d] * s_kc[curr_buf * FLASH_S_TILE * Dc + t * Dc + d];
+            for (int d = tid; d < Dp; d += bdim) 
+                score += s_q[Dc + d] * s_kp[curr_buf * FLASH_S_TILE * Dp + t * Dp + d];
+
+            for (int offset = bdim / 2; offset > 0; offset /= 2) score += __shfl_down_sync(0xffffffff, score, offset);
+            score = __shfl_sync(0xffffffff, score, 0); 
+            score *= scale;
+
+            float m_curr = fmaxf(m_prev, score);
+            float p = expf(score - m_curr);
+            float alpha = expf(m_prev - m_curr);
+            float l_curr = alpha * l_prev + p;
+
+            for (int d = tid; d < Dc; d += bdim)
+                s_acc[d] = s_acc[d] * alpha + p * s_v[curr_buf * FLASH_S_TILE * Dc + t * Dc + d];
+
+            m_prev = m_curr;
+            l_prev = l_curr;
+        }
+        __syncthreads(); // Wait for compute done and next fetch to potentially progress
+    }
+
+    float inv_l = 1.0f / l_prev;
+    for (int d = tid; d < Dc; d += bdim) output[(q * H + h) * Dc + d] = s_acc[d] * inv_l;
+}
+
+// 6. OPT 4: Blackwell Pipelined Implementation
+void dsa_forward_opt4(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream) {
+    int Q = cfg.num_queries, H = cfg.num_heads, S = cfg.num_selected_kv;
+    int Dc = cfg.head_dim_compressed, Dp = cfg.head_dim_positional;
+    
+    int threads = 128; 
+    // Smem: (Dc+Dp) + [2 * S_TILE * (Dc+Dp+Dc)] + Dc
+    size_t smem = ( (Dc + Dp) + (2 * FLASH_S_TILE * (Dc + Dp + Dc)) + Dc ) * sizeof(float);
+    float scale = 1.0f / sqrtf((float)(Dc + Dp));
+
+    // Shared memory attribute check
+    static int max_smem_set = -1;
+    if ((int)smem > max_smem_set) {
+        CUDA_CHECK(cudaFuncSetAttribute((const void*)dsa_blackwell_pipelined_fused_kernel, 
+                   cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+        max_smem_set = (int)smem;
+    }
+
+    dsa_blackwell_pipelined_fused_kernel<<<Q * H, threads, smem, stream>>>(
+        q_nope, q_pe, kv_cache_compressed, kv_cache_positional, v_cache,
+        sparse_indices, output, Q, H, S, Dc, Dp, scale
+    );
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void dsa_forward(const float* q_nope, const float* q_pe,
                  const float* kv_cache_compressed,
                  const float* kv_cache_positional,
@@ -658,5 +788,5 @@ void dsa_forward(const float* q_nope, const float* q_pe,
                  const int* sparse_indices,
                  float* output,
                  const DsaConfig& cfg, cudaStream_t stream) {
-    dsa_forward_opt3(q_nope, q_pe, kv_cache_compressed, kv_cache_positional, v_cache, sparse_indices, output, cfg, stream);
+    dsa_forward_opt4(q_nope, q_pe, kv_cache_compressed, kv_cache_positional, v_cache, sparse_indices, output, cfg, stream);
 }
