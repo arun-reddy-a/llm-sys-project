@@ -8,7 +8,8 @@
 
 struct MoeConfig {
     int num_tokens;        // T – number of input tokens
-    int num_experts;       // E – total experts
+    int num_experts;       // E_global – total experts (routing dimension)
+    int num_local_experts; // E_local – experts on this GPU (weight dimension)
     int top_k;             // K – experts selected per token
     int hidden_dim;        // D – model hidden dimension
     int intermediate_dim;  // I – FFN intermediate dimension (per expert)
@@ -90,12 +91,12 @@ void moe_forward_opt4(const float* input, const float* gate_weight,
                       const float* w1, const float* w2, float* output,
                       const MoeConfig& cfg, cudaStream_t stream = 0);
 
-// 6. OPT 5: Blackwell TMA (Double-Buffered Grouped-GEMM using Tensor Memory Accelerator)
+// 6. OPT 5: Double-Buffered Grouped GEMM (software-managed pipelining)
 void moe_forward_opt5(const float* input, const float* gate_weight,
                       const float* w1, const float* w2, float* output,
                       const MoeConfig& cfg, cudaStream_t stream = 0);
 
-// Defaults to the best available implementation (Opt 5 on Blackwell)
+// Defaults to the current best available implementation in this repo.
 void moe_forward(const float* input, const float* gate_weight,
                  const float* w1, const float* w2, float* output,
                  const MoeConfig& cfg, cudaStream_t stream = 0);

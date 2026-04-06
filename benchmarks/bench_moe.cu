@@ -15,13 +15,13 @@ typedef void (*moe_fn)(const float*, const float*, const float*, const float*, f
 
 static void bench_one(const char* variant_name, moe_fn func, const BenchConfig& bc, int warmup, int iters) {
     const MoeConfig& cfg = bc.moe;
-    int T = cfg.num_tokens, E = cfg.num_experts;
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
     int D = cfg.hidden_dim, I = cfg.intermediate_dim;
 
     size_t input_sz = T * D;
-    size_t gate_sz  = E * D;
-    size_t w1_sz    = (size_t)E * 2 * I * D;
-    size_t w2_sz    = (size_t)E * D * I;
+    size_t gate_sz  = (size_t)E * D;           // routing: [E_global, D]
+    size_t w1_sz    = (size_t)E_local * 2 * I * D;  // weights: [E_local, 2*I, D]
+    size_t w2_sz    = (size_t)E_local * D * I;       // weights: [E_local, D, I]
 
     std::vector<float> h_input(input_sz), h_gate(gate_sz);
     std::vector<float> h_w1(w1_sz), h_w2(w2_sz);
@@ -87,9 +87,15 @@ int main(int argc, char** argv) {
 
     srand(123);
 
+    // {num_tokens, num_experts(global), num_local_experts, top_k, hidden_dim, intermediate_dim}
     BenchConfig configs[] = {
-        {"T=64,E=8,K=2,D=256,I=512",   {64,  8, 2, 256,  512}},
-        {"T=128,E=16,K=2,D=512,I=1024",{128,16, 2, 512, 1024}},
+        // Small synthetic configs (E_local == E_global, single-node)
+        {"T=64,E=8,K=2,D=256,I=512",    {64,   8,  8, 2, 256,  512}},
+        {"T=128,E=16,K=2,D=512,I=1024", {128, 16, 16, 2, 512, 1024}},
+        // DeepSeek-V3 config: E_global=256, E_local=32, K=8, D=7168, I=2048
+        {"T=64,E=256,EL=32,K=8,D=7168,I=2048",   {64,  256, 32, 8, 7168, 2048}},
+        {"T=512,E=256,EL=32,K=8,D=7168,I=2048",  {512, 256, 32, 8, 7168, 2048}},
+        {"T=2048,E=256,EL=32,K=8,D=7168,I=2048", {2048,256, 32, 8, 7168, 2048}},
     };
 
     struct { const char* name; moe_fn fn; } variants[] = {

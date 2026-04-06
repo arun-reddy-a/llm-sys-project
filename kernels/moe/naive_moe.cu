@@ -320,8 +320,7 @@ __global__ void scatter_kernel(const float* expert_out, const int* token_map,
                                int expert_id, float* output,
                                int count, int T, int K, int D) {
     int idx = blockIdx.x;
-    int d   = threadIdx.x;
-    if (idx >= count || d >= D) return;
+    if (idx >= count) return;
 
     int t = token_map[idx];
 
@@ -333,7 +332,9 @@ __global__ void scatter_kernel(const float* expert_out, const int* token_map,
         }
     }
 
-    atomicAdd(&output[t * D + d], w * expert_out[idx * D + d]);
+    // Stride loop handles D > 1024 (max threads per block)
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        atomicAdd(&output[t * D + d], w * expert_out[idx * D + d]);
 }
 
 // ===================================================================
@@ -389,10 +390,11 @@ void moe_scatter(const float* expert_out, const int* token_map,
                  const MoeConfig& cfg, cudaStream_t stream) {
     if (count == 0) return;
     int D = cfg.hidden_dim;
-    scatter_kernel<<<count, D, 0, stream>>>(expert_out, token_map,
-                                             expert_weights, expert_indices,
-                                             expert_id, output, count,
-                                             cfg.num_tokens, cfg.top_k, D);
+    int threads = min(D, 1024);
+    scatter_kernel<<<count, threads, 0, stream>>>(expert_out, token_map,
+                                                   expert_weights, expert_indices,
+                                                   expert_id, output, count,
+                                                   cfg.num_tokens, cfg.top_k, D);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -400,9 +402,10 @@ void moe_scatter(const float* expert_out, const int* token_map,
 void moe_forward_naive(const float* d_input, const float* d_gate_weight,
                        const float* d_w1, const float* d_w2, float* d_output,
                        const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    // --- Naive Routing ---
+    // --- Naive Routing (over all E_global experts) ---
     DeviceBuf<float> d_logits(T * E);
     gate_logits_kernel<<<T, E, 0, stream>>>(d_input, d_gate_weight, d_logits.ptr, T, E, D);
     softmax_experts_kernel<<<(T + 255) / 256, 256, 0, stream>>>(d_logits.ptr, T, E);
@@ -419,7 +422,8 @@ void moe_forward_naive(const float* d_input, const float* d_gate_weight,
     DeviceBuf<float> act_out(T * I);
     DeviceBuf<float> gemm2_out(T * D);
 
-    for (int e = 0; e < E; e++) {
+    // Only compute over local experts [0..E_local)
+    for (int e = 0; e < E_local; e++) {
         moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
         int h_count = 0;
         CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -449,9 +453,10 @@ void moe_forward_naive(const float* d_input, const float* d_gate_weight,
 void moe_forward_opt1(const float* d_input, const float* d_gate_weight,
                       const float* d_w1, const float* d_w2, float* d_output,
                       const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    // --- Naive Routing (same as baseline) ---
+    // --- Naive Routing (over all E_global experts) ---
     DeviceBuf<float> d_logits(T * E);
     gate_logits_kernel<<<T, E, 0, stream>>>(d_input, d_gate_weight, d_logits.ptr, T, E, D);
     softmax_experts_kernel<<<(T + 255) / 256, 256, 0, stream>>>(d_logits.ptr, T, E);
@@ -463,7 +468,7 @@ void moe_forward_opt1(const float* d_input, const float* d_gate_weight,
     DeviceBuf<float> gathered(T * D), gemm1_out(T * 2 * I), act_out(T * I), gemm2_out(T * D);
     DeviceBuf<int> token_map(T), d_count(1);
 
-    for (int e = 0; e < E; e++) {
+    for (int e = 0; e < E_local; e++) {
         moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
         int h_count = 0;
         CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -493,9 +498,10 @@ void moe_forward_opt1(const float* d_input, const float* d_gate_weight,
 void moe_forward_opt2(const float* d_input, const float* d_gate_weight,
                       const float* d_w1, const float* d_w2, float* d_output,
                       const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+    int T = cfg.num_tokens, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    // --- Fused Routing ---
+    // --- Fused Routing (over all E_global experts) ---
     DeviceBuf<int>   expert_indices(T * K);
     DeviceBuf<float> expert_weights(T * K);
     moe_gate(d_input, d_gate_weight, expert_indices.ptr, expert_weights.ptr, cfg, stream);
@@ -504,7 +510,7 @@ void moe_forward_opt2(const float* d_input, const float* d_gate_weight,
     DeviceBuf<float> gathered(T * D), gemm1_out(T * 2 * I), act_out(T * I), gemm2_out(T * D);
     DeviceBuf<int> token_map(T), d_count(1);
 
-    for (int e = 0; e < E; e++) {
+    for (int e = 0; e < E_local; e++) {
         moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
         int h_count = 0;
         CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
@@ -611,8 +617,6 @@ __global__ void grouped_scatter_kernel(const float* grouped_out,
                                        int T, int K, int D, int E) {
     // blockIdx.x = index in the GROUPED buffer
     int tk = blockIdx.x;
-    int d = threadIdx.x;
-    if (d >= D) return;
     int e = 0;
     while (e < E - 1 && tk >= expert_offsets[e+1]) e++;
     if (tk >= expert_offsets[E]) return;
@@ -625,21 +629,24 @@ __global__ void grouped_scatter_kernel(const float* grouped_out,
             break;
         }
     }
-    atomicAdd(&global_out[t * D + d], w * grouped_out[tk * D + d]);
+    // Stride loop handles D > 1024 (max threads per block)
+    for (int d = threadIdx.x; d < D; d += blockDim.x)
+        atomicAdd(&global_out[t * D + d], w * grouped_out[tk * D + d]);
 }
 
 // 4. OPT 3: Grouped Implementation
 void moe_forward_opt3(const float* d_input, const float* d_gate_weight,
                       const float* d_w1, const float* d_w2, float* d_output,
                       const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    // 1. Fused Routing
+    // 1. Fused Routing (over all E_global experts)
     DeviceBuf<int>   expert_indices(T * K);
     DeviceBuf<float> expert_weights(T * K);
     moe_gate(d_input, d_gate_weight, expert_indices.ptr, expert_weights.ptr, cfg, stream);
 
-    // 2. Count tokens per expert
+    // 2. Count tokens per expert (all E_global buckets for correct routing)
     DeviceBuf<int> expert_counts(E + 1);
     expert_counts.zero();
     DeviceBuf<int> token_idx_in_expert(T * K);
@@ -647,53 +654,55 @@ void moe_forward_opt3(const float* d_input, const float* d_gate_weight,
         expert_indices.ptr, expert_counts.ptr, token_idx_in_expert.ptr, T, K, E
     );
 
-    // 3. Prefix Sum for offsets (small E, do on CPU or simple kernel)
+    // 3. Prefix Sum for offsets (all E_global experts)
     std::vector<int> h_counts(E + 1);
     CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // Minimal sync here, or use Thrust.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<int> h_offsets(E + 1);
     h_offsets[0] = 0;
     for (int i = 0; i < E; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
     DeviceBuf<int> expert_offsets(E + 1);
     expert_offsets.upload(h_offsets.data());
 
-    int total_active = h_offsets[E];
-    if (total_active == 0) return;
+    // Only process tokens assigned to local experts [0..E_local)
+    int total_local = h_offsets[E_local];
+    if (total_local == 0) return;
 
-    // 4. Reorder tokens
+    // 4. Reorder tokens (all T*K assignments, but GEMM only uses first total_local rows)
+    int total_active = h_offsets[E];
     DeviceBuf<float> grouped_input(total_active * D);
     DeviceBuf<int>   grouped_token_map(total_active);
     group_reorder_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
-        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr, 
+        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr,
         grouped_input.ptr, grouped_token_map.ptr, T, K, D
     );
 
     CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
-    DeviceBuf<float> g_gemm1_out(total_active * 2 * I), g_act_out(total_active * I), g_gemm2_out(total_active * D);
+    DeviceBuf<float> g_gemm1_out(total_local * 2 * I), g_act_out(total_local * I), g_gemm2_out(total_local * D);
 
-    // 5. Grouped GEMM 1: W1 [E, 2*I, D]
+    // 5. Grouped GEMM 1: W1 [E_local, 2*I, D] – only local experts
     {
         dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, (total_active + TILE_SIZE - 1) / TILE_SIZE);
+        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, (total_local + TILE_SIZE - 1) / TILE_SIZE);
         grouped_gemm_bt_kernel<<<grid, block, 0, stream>>>(
-            grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, D, 2 * I, E);
+            grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, D, 2 * I, E_local);
     }
 
     // 6. SwiGLU
-    swiglu_strided_kernel<<<(total_active * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_active, I);
+    swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_local, I);
 
-    // 7. Grouped GEMM 2: W2 [E, D, I]
+    // 7. Grouped GEMM 2: W2 [E_local, D, I]
     {
         dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, (total_active + TILE_SIZE - 1) / TILE_SIZE);
+        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, (total_local + TILE_SIZE - 1) / TILE_SIZE);
         grouped_gemm_bt_kernel<<<grid, block, 0, stream>>>(
-            g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, I, D, E);
+            g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, I, D, E_local);
     }
 
-    // 8. Grouped Scatter
-    grouped_scatter_kernel<<<total_active, D, 0, stream>>>(
-        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr, 
-        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E
+    // 8. Grouped Scatter (only local tokens)
+    grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
+        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr,
+        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E_local
     );
 }
 
@@ -819,17 +828,24 @@ __global__ void fused_moe_kernel(const float* __restrict__ input,
 }
 
 // 5. OPT 4: Fused Expert Implementation
+// Note: fused kernel routes and accesses weights by expert id in smem, so it uses
+// E_local for both routing and computation (can't cleanly separate global routing).
 void moe_forward_opt4(const float* d_input, const float* d_gate_weight,
                       const float* d_w1, const float* d_w2, float* d_output,
                       const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+    int T = cfg.num_tokens, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    int threads = 128; // Enough to cover D and E
-    // smem: D + E + 2*I + D (floats)
-    size_t smem = (D + E + 2 * I + D) * sizeof(float);
+    int threads = 128;
+    // smem: D + E_local + 2*I + D (floats)
+    size_t smem = (size_t)(D + E_local + 2 * I + D) * sizeof(float);
+
+    // Allow >48KB dynamic shared memory (needed when D=7168: ~72KB)
+    CUDA_CHECK(cudaFuncSetAttribute(fused_moe_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
 
     fused_moe_kernel<<<T, threads, smem, stream>>>(
-        d_input, d_gate_weight, d_w1, d_w2, d_output, T, E, D, I, K
+        d_input, d_gate_weight, d_w1, d_w2, d_output, T, E_local, D, I, K
     );
     CUDA_CHECK(cudaGetLastError());
 }
@@ -837,8 +853,9 @@ void moe_forward_opt4(const float* d_input, const float* d_gate_weight,
 #include <cuda_pipeline_primitives.h>
 
 // ===================================================================
-// BLACKWELL SPECIFIC: Double-Buffered Async Pipelined Grouped-GEMM
-// This overlaps weight DRAM fetches for tile N+1 with computation of tile N.
+// OPT 5: Double-buffered grouped GEMM with software-managed pipelining.
+// This overlaps tile staging for iteration N+1 with computation for N using
+// ordinary shared-memory buffers and block-wide synchronization.
 // ===================================================================
 
 __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
@@ -883,8 +900,8 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
             int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
             int b_col = next_t * TILE_SIZE + threadIdx.x;
             float val = (b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
-            // In a full Blackwell implementation, we would use TMA here.
-            // Using smem as a staging area.
+            // This remains a software-managed staging path. A true TMA path
+            // would replace these scalar loads with tensor-map async copies.
             Bs[next_buf][threadIdx.x][threadIdx.y] = val;
         }
 
@@ -902,11 +919,12 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
     C[row * N + col] = sum;
 }
 
-// 6. OPT 5: Blackwell Implementation
+// 6. OPT 5: Double-buffered grouped GEMM implementation
 void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
                       const float* d_w1, const float* d_w2, float* d_output,
                       const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
     // Reuse Grouped logic from Opt 3 (Indices/Offsets/Reorder)
     DeviceBuf<int>   expert_indices(T * K);
@@ -922,47 +940,49 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
 
     std::vector<int> h_counts(E + 1);
     CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream)); 
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<int> h_offsets(E + 1);
     h_offsets[0] = 0;
     for (int i = 0; i < E; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
     DeviceBuf<int> expert_offsets(E + 1);
     expert_offsets.upload(h_offsets.data());
 
-    int total_active = h_offsets[E];
-    if (total_active == 0) return;
+    // Only process tokens assigned to local experts [0..E_local)
+    int total_local = h_offsets[E_local];
+    if (total_local == 0) return;
 
+    int total_active = h_offsets[E];
     DeviceBuf<float> grouped_input(total_active * D);
     DeviceBuf<int>   grouped_token_map(total_active);
     group_reorder_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
-        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr, 
+        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr,
         grouped_input.ptr, grouped_token_map.ptr, T, K, D
     );
 
     CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
-    DeviceBuf<float> g_gemm1_out(total_active * 2 * I), g_act_out(total_active * I), g_gemm2_out(total_active * D);
+    DeviceBuf<float> g_gemm1_out(total_local * 2 * I), g_act_out(total_local * I), g_gemm2_out(total_local * D);
 
-    // Blackwell Double-Buffered Grouped GEMM 1
+    // Double-buffered Grouped GEMM 1 (local experts only)
     {
         dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, (total_active + TILE_SIZE - 1) / TILE_SIZE);
+        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, (total_local + TILE_SIZE - 1) / TILE_SIZE);
         grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-            grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, D, 2 * I, E);
+            grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, D, 2 * I, E_local);
     }
 
-    swiglu_strided_kernel<<<(total_active * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_active, I);
+    swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_local, I);
 
-    // Blackwell Double-Buffered Grouped GEMM 2
+    // Double-buffered Grouped GEMM 2 (local experts only)
     {
         dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, (total_active + TILE_SIZE - 1) / TILE_SIZE);
+        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, (total_local + TILE_SIZE - 1) / TILE_SIZE);
         grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-            g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, I, D, E);
+            g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, I, D, E_local);
     }
 
-    grouped_scatter_kernel<<<total_active, D, 0, stream>>>(
-        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr, 
-        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E
+    grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
+        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr,
+        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E_local
     );
 }
 
