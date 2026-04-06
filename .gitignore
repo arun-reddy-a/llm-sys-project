@@ -1,2 +1,8 @@
 build/
 *txt
+profiling/local_results/
+*.nsys-rep
+*.ncu-rep
+*.sqlite
+*.csv
+results.jsonl

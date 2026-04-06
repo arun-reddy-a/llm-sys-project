@@ -109,15 +109,15 @@ profile_vadd_ncu: $(SIMPLE_VADD)
 
 # Stage 1: Timeline Trace (Nsight Systems — find the slow kernel)
 profile_moe_1: bench_moe_smoke
-	./profiling/profile_moe.sh --stage 1 --variant $(VARIANT) --bench-bin ./build/bench_moe_smoke
+	./profiling/profile_moe.sh --stage 1 --variant $(VARIANT) --run-id "$(RUN_ID)" --bench-bin ./build/bench_moe_smoke
 
 # Stage 2: Deep Dive (Nsight Compute — roofline, memory, compute, occupancy)
 profile_moe_2: bench_moe_smoke
-	./profiling/profile_moe.sh --stage 2 --variant $(VARIANT) --bench-bin ./build/bench_moe_smoke
+	./profiling/profile_moe.sh --stage 2 --variant $(VARIANT) --run-id "$(RUN_ID)" --bench-bin ./build/bench_moe_smoke
 
 # Stage 3: Automated Diagnosis (parse NCU metrics into recommendations)
 profile_moe_3:
-	./profiling/profile_moe.sh --stage 3 --variant $(VARIANT)
+	./profiling/profile_moe.sh --stage 3 --variant $(VARIANT) --run-id "$(RUN_ID)"
 
 # All 3 stages in sequence
 profile_moe_full: profile_moe_1 profile_moe_2 profile_moe_3

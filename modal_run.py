@@ -74,15 +74,24 @@ def log_result(target: str, result: dict):
     volumes={"/workspace/profiling/results": results_vol},
     timeout=600,       # 10 min max run time
 )
-def run_make_target(target: str) -> dict:
+def run_make_target(target: str, run_id: str = "", variant: str = "") -> dict:
     """Run a specific Makefile target in the remote container."""
     print(f"\n🚀 [modal] Executing: 'make {target}'")
     print(f"   Environment: nvidia/cuda:12.8.1-devel-ubuntu24.04")
     print(f"   GPU        : B200 (single)")
+    if run_id: print(f"   Run ID     : {run_id}")
+    if variant: print(f"   Variant    : {variant}")
 
     # Run the make command in /workspace and stream output
     import subprocess
     import sys
+    import os
+
+    env = os.environ.copy()
+    if run_id:
+        env["RUN_ID"] = run_id
+    if variant:
+        env["VARIANT"] = variant
 
     process = subprocess.Popen(
         ["make", target],
@@ -90,6 +99,7 @@ def run_make_target(target: str) -> dict:
         stderr=subprocess.STDOUT,
         text=True,
         cwd="/workspace",
+        env=env,
         bufsize=1
     )
 
@@ -108,15 +118,15 @@ def run_make_target(target: str) -> dict:
 
 
 @app.local_entrypoint()
-def main(target: str = "bench_moe_smoke"):
+def main(target: str = "bench_moe_smoke", variant: str = "Opt5"):
     """
     Local entrypoint to run benchmarks or profiling on cloud GPUs.
 
     Usage:
         modal run modal_run.py --target bench_moe_smoke
-        modal run modal_run.py --target profile_moe_1
+        modal run modal_run.py --target profile_moe_1 --variant Opt5
     
-    Results are logged to results.jsonl (one JSON object per line).
+    Results are logged to results.jsonl, and if profiling, raw files are fetched locally.
     """
     print("\n===========================================================")
     print("=                                                         =")
@@ -126,10 +136,13 @@ def main(target: str = "bench_moe_smoke"):
 
     targets = target.split(",")
     failed = []
+    
+    # Generate unique run ID for tracking output files
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for t in targets:
         t = t.strip()
-        res = run_make_target.remote(t)
+        res = run_make_target.remote(t, run_id, variant)
 
         if res["returncode"] == 0:
             print(f"   ✅ Target '{t}' PASSED.")
@@ -140,6 +153,36 @@ def main(target: str = "bench_moe_smoke"):
         # Log every run as structured JSON
         log_result(t, res)
         print(f"   📝 Logged to {RESULTS_FILE}")
+
+    if not failed and any("profile" in t for t in targets):
+        import subprocess
+        print(f"\n📥 Fetching profiling results for RUN_ID: {run_id}...")
+        local_dir = "profiling/local_results"
+        os.makedirs(local_dir, exist_ok=True)
+        
+        # We explicitly request the files we expect to be generated
+        base_name = f"moe_{variant}_{run_id}"
+        expected_files = [
+            f"{base_name}_nsys.nsys-rep",
+            f"{base_name}_nsys.sqlite",
+            f"{base_name}_ncu.ncu-rep",
+            f"{base_name}_ncu.csv",
+            f"{base_name}_ncu_console.log"
+        ]
+        
+        for file in expected_files:
+            try:
+                subprocess.run(
+                    ["modal", "volume", "get", "llm-sys-profiling-results", file, f"{local_dir}/{file}"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                print(f"   ✅ Downloaded: {file}")
+            except subprocess.CalledProcessError:
+                # Some files might not exist depending on the stage executed, which is expected.
+                pass
+                
+        print(f"\n   To analyze locally, run:")
+        print(f"   python3 profiling/diagnose_moe.py {local_dir}/{base_name}_ncu.csv")
 
     if failed:
         print(f"\n==============================================")

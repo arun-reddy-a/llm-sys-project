@@ -37,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --stage)    STAGE="$2";   shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
         --bench-bin) BENCH_BIN="$2"; shift 2 ;;
+        --run-id)   RUN_ID="$2"; shift 2 ;;
         -h|--help)
             head -25 "$0" | tail -20
             exit 0
@@ -46,8 +47,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 mkdir -p "${OUTPUT_DIR}"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-PREFIX="${OUTPUT_DIR}/moe_${VARIANT}_${TIMESTAMP}"
+if [ -z "${RUN_ID:-}" ]; then
+    RUN_ID=$(date +%Y%m%d_%H%M%S)
+fi
+PREFIX="${OUTPUT_DIR}/moe_${VARIANT}_${RUN_ID}"
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║          MoE Profiling — Full Decision Tree                 ║"
