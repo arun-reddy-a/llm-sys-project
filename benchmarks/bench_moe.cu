@@ -70,11 +70,12 @@ static void bench_one(const char* variant_name, moe_fn func, const BenchConfig& 
 
     printf("  %-10s  %-28s  %8.3f  %8.3f  %12.0f\n",
            variant_name, bc.label, t_min, t_mean, tokens_per_sec);
+    fflush(stdout);
 }
 
 int main(int argc, char** argv) {
-    int warmup = 10;
-    int iters  = 50;
+    int warmup = 2;
+    int iters  = 10;
 
     if (argc > 1) warmup = atoi(argv[1]);
     if (argc > 2) iters  = atoi(argv[2]);
@@ -99,11 +100,6 @@ int main(int argc, char** argv) {
     };
 
     struct { const char* name; moe_fn fn; } variants[] = {
-        {"Naive", moe_forward_naive},
-        {"Opt1",  moe_forward_opt1},
-        {"Opt2",  moe_forward_opt2},
-        {"Opt3",  moe_forward_opt3},
-        {"Opt4",  moe_forward_opt4},
         {"Opt5",  moe_forward_opt5},
     };
 
@@ -112,6 +108,7 @@ int main(int argc, char** argv) {
             bench_one(v.name, v.fn, bc, warmup, iters);
         }
         printf("  %s\n", std::string(100, '-').c_str());
+        fflush(stdout);
     }
 
     printf("\n");
