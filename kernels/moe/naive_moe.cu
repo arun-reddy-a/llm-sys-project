@@ -885,40 +885,56 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
 
     int tile_m_within_e = tile_m_global - m_tile_offsets[e];
     
-    int global_row = expert_offsets[e] + tile_m_within_e * TILE_SIZE + threadIdx.y;
-    int global_col = tile_n * TILE_SIZE + threadIdx.x;
+    int global_row_base = expert_offsets[e] + tile_m_within_e * TILE_SIZE;
+    int global_col_base = tile_n * TILE_SIZE;
     
     int expert_total_rows = expert_offsets[e+1] - expert_offsets[e];
-    int row_within_e = tile_m_within_e * TILE_SIZE + threadIdx.y;
+    int row_within_e_base = tile_m_within_e * TILE_SIZE;
 
     const float* W_e = W_ptr + (size_t)e * N * D;
 
     // Double buffers for weights (Bs) and activations (As)
+    // Bs padded by 4 floats (16 bytes) to maintain float4 alignment while shifting SMEM banks
     __shared__ float As[2][TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 1]; // +1 to avoid bank conflicts
+    __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 4];
 
     float sum = 0.0f;
     int numTiles = (D + TILE_SIZE - 1) / TILE_SIZE;
+    int tid = threadIdx.y * TILE_SIZE + threadIdx.x;
 
     // --- PROLOGUE: Async Prefetch Tile 0 ---
     {
-        int a_col = 0 * TILE_SIZE + threadIdx.x;
-        bool valid_A = (row_within_e < expert_total_rows && a_col < D);
-        if (valid_A) {
-            __pipeline_memcpy_async(&As[0][threadIdx.y][threadIdx.x], &A[global_row * D + a_col], sizeof(float));
-        } else {
-            As[0][threadIdx.y][threadIdx.x] = 0.0f;
-        }
+        if (tid < 64) {
+            int row_in_tile = tid / 4;
+            int col_in_tile = (tid % 4) * 4;
+            int a_col = 0 * TILE_SIZE + col_in_tile;
+            
+            bool valid_A = (row_within_e_base + row_in_tile < expert_total_rows && a_col < D);
+            if (valid_A) {
+                __pipeline_memcpy_async(&As[0][row_in_tile][col_in_tile], &A[(global_row_base + row_in_tile) * D + a_col], sizeof(float4));
+            } else {
+                As[0][row_in_tile][col_in_tile + 0] = 0.0f;
+                As[0][row_in_tile][col_in_tile + 1] = 0.0f;
+                As[0][row_in_tile][col_in_tile + 2] = 0.0f;
+                As[0][row_in_tile][col_in_tile + 3] = 0.0f;
+            }
+        } else if (tid < 128) {
+            int t_tid = tid - 64;
+            int row_in_tile = t_tid / 4;
+            int col_in_tile = (t_tid % 4) * 4;
+            int b_row = global_col_base + row_in_tile;
+            int b_col = 0 * TILE_SIZE + col_in_tile;
 
-        int b_row = (global_col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
-        int b_col = 0 * TILE_SIZE + threadIdx.x;
-        bool valid_B = (global_col < N && b_row < N && b_col < D);
-        if (valid_B) {
-            __pipeline_memcpy_async(&Bs[0][threadIdx.x][threadIdx.y], &W_e[b_row * D + b_col], sizeof(float));
-        } else {
-            Bs[0][threadIdx.x][threadIdx.y] = 0.0f;
+            bool valid_B = (b_row < N && b_col < D); // W_e is [N, D]
+            if (valid_B) {
+                __pipeline_memcpy_async(&Bs[0][row_in_tile][col_in_tile], &W_e[b_row * D + b_col], sizeof(float4));
+            } else {
+                Bs[0][row_in_tile][col_in_tile + 0] = 0.0f;
+                Bs[0][row_in_tile][col_in_tile + 1] = 0.0f;
+                Bs[0][row_in_tile][col_in_tile + 2] = 0.0f;
+                Bs[0][row_in_tile][col_in_tile + 3] = 0.0f;
+            }
         }
-
         __pipeline_commit();
     }
 
@@ -930,22 +946,36 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
 
         // Initiate async fetch for Tile N+1
         if (next_t < numTiles) {
-            int a_col = next_t * TILE_SIZE + threadIdx.x;
-            bool valid_A = (row_within_e < expert_total_rows && a_col < D);
-            if (valid_A) {
-                __pipeline_memcpy_async(&As[next_buf][threadIdx.y][threadIdx.x], &A[global_row * D + a_col], sizeof(float));
-            } else {
-                As[next_buf][threadIdx.y][threadIdx.x] = 0.0f;
-            }
+            if (tid < 64) {
+                int row_in_tile = tid / 4;
+                int col_in_tile = (tid % 4) * 4;
+                int a_col = next_t * TILE_SIZE + col_in_tile;
+                
+                bool valid_A = (row_within_e_base + row_in_tile < expert_total_rows && a_col < D);
+                if (valid_A) {
+                    __pipeline_memcpy_async(&As[next_buf][row_in_tile][col_in_tile], &A[(global_row_base + row_in_tile) * D + a_col], sizeof(float4));
+                } else {
+                    As[next_buf][row_in_tile][col_in_tile + 0] = 0.0f;
+                    As[next_buf][row_in_tile][col_in_tile + 1] = 0.0f;
+                    As[next_buf][row_in_tile][col_in_tile + 2] = 0.0f;
+                    As[next_buf][row_in_tile][col_in_tile + 3] = 0.0f;
+                }
+            } else if (tid < 128) {
+                int t_tid = tid - 64;
+                int row_in_tile = t_tid / 4;
+                int col_in_tile = (t_tid % 4) * 4;
+                int b_row = global_col_base + row_in_tile;
+                int b_col = next_t * TILE_SIZE + col_in_tile;
 
-            int b_row = (global_col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
-            int b_col = next_t * TILE_SIZE + threadIdx.x;
-            bool valid_B = (global_col < N && b_row < N && b_col < D);
-            if (valid_B) {
-                // Transposed load for B
-                __pipeline_memcpy_async(&Bs[next_buf][threadIdx.x][threadIdx.y], &W_e[b_row * D + b_col], sizeof(float));
-            } else {
-                Bs[next_buf][threadIdx.x][threadIdx.y] = 0.0f;
+                bool valid_B = (b_row < N && b_col < D);
+                if (valid_B) {
+                    __pipeline_memcpy_async(&Bs[next_buf][row_in_tile][col_in_tile], &W_e[b_row * D + b_col], sizeof(float4));
+                } else {
+                    Bs[next_buf][row_in_tile][col_in_tile + 0] = 0.0f;
+                    Bs[next_buf][row_in_tile][col_in_tile + 1] = 0.0f;
+                    Bs[next_buf][row_in_tile][col_in_tile + 2] = 0.0f;
+                    Bs[next_buf][row_in_tile][col_in_tile + 3] = 0.0f;
+                }
             }
             __pipeline_commit();
         }
@@ -957,14 +987,16 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
         // Compute Tile N from SMEM registers
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; i++) {
-            sum += As[curr_buf][threadIdx.y][i] * Bs[curr_buf][i][threadIdx.x];
+            // As is [TILE_SIZE][TILE_SIZE]. threadIdx.y is output token row.
+            // Bs is [TILE_SIZE][TILE_SIZE+4]. threadIdx.x is output expert channel. W_e is [N, D].
+            sum += As[curr_buf][threadIdx.y][i] * Bs[curr_buf][threadIdx.x][i];
         }
         __syncthreads(); 
     }
     
     // --- EPILOGUE: Write Result ---
-    if (row_within_e < expert_total_rows && global_col < N) {
-        C[global_row * N + global_col] = sum;
+    if (row_within_e_base + threadIdx.y < expert_total_rows && global_col_base + threadIdx.x < N) {
+        C[(global_row_base + threadIdx.y) * N + (global_col_base + threadIdx.x)] = sum;
     }
 }
 
