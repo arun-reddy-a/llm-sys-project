@@ -96,7 +96,7 @@ Benchmark iterations can be configured via CLI arguments:
 │   └── simple_vadd.cu              # Simple vector-add (profiling toolchain validation)
 ├── profiling/
 │   ├── profile_moe.sh              # 3-stage profiling orchestrator (nsys → ncu → diagnosis)
-│   ├── diagnose_moe.py             # Decision-tree bottleneck analyzer
+│   ├── diagnose_moe.py             # Advanced wide-format Nsight Compute CSV parser
 │   ├── analyze_ncu.py              # Lightweight NCU CSV parser
 │   └── results/                    # Generated .nsys-rep, .ncu-rep, .csv files
 ├── docs/
@@ -179,23 +179,16 @@ Benchmarks report min/mean/median/max latency and throughput across multiple pro
 
 ### MoE Kernel Optimizations
 
-Listed in order from most basic to most advanced. Each builds on the previous.
+Listed in order from most basic to most advanced. Each builds on the previous. See [docs/moe/README.md](docs/moe/README.md) for deeper architectural analysis of these iterations.
 
-1. - [x] **Shared-memory tiled GEMM** -- Replace the naive per-element GEMM with a classic 2D-tiled GEMM using shared memory to exploit data reuse within a thread block. This is the single largest improvement for compute-bound sizes. (completed)
-
-2. - [x] **Fused routing pipeline** -- Merge gate-logits, softmax, and top-K selection into a single kernel. Eliminates the intermediate logit tensor write/read to DRAM. (completed)
-
-3. **Single-pass token permutation** -- Replace the per-expert gather/scatter (one DRAM pass per expert) with a single upfront permutation kernel that sorts all tokens by expert assignment and computes per-expert offsets. Reduces gather/scatter from E passes to 1.
-
-4. **Grouped-GEMM over all active experts** -- Instead of launching one GEMM per expert in a host loop, issue a single Grouped-GEMM kernel that processes all expert sub-batches simultaneously. Eliminates per-expert launch overhead and enables SM packing across experts.
-
-5. **Fuse GEMM1 + SwiGLU + GEMM2 into a persistent kernel** -- Keep the intermediate activation tensor in shared memory between GEMM1 and GEMM2, avoiding a full DRAM round-trip for the SwiGLU intermediate. Requires careful shared memory budgeting.
-
-6. **TMEM-based asynchronous prefetching (Blackwell SM 10.0)** -- Replace manual shared memory loads with Tensor Memory (TMEM) hardware-managed asynchronous copies. Enables 3-4 stage compute/memory pipeline overlap with no software orchestration.
-
-7. **NVFP4 weight quantization with hardware-fused dequantization** -- Store expert weights in NVFP4 format (halving weight bandwidth vs FP8). Blackwell MMA instructions dequantize in hardware at zero software cost.
-
-8. **Thread block clusters for weight broadcasting** -- Use SM 10.0 thread block clusters to broadcast shared expert weights across thread blocks via distributed shared memory, reducing redundant global memory reads.
+1. - [x] **Shared-memory tiled GEMM** -- Replaced the naive per-element GEMM with a classic 2D-tiled GEMM.
+2. - [x] **Fused routing pipeline** -- Merged gate-logits, softmax, and top-K selection into a single kernel, avoiding D-RAM roundtrips.
+3. - [x] **Single-pass token permutation / Grouped-GEMM** -- Replaced per-expert gather/scatter passes with a unified Grouped-GEMM that processes all expert batches synchronously.
+4. - [x] **Persistent Threads (Failed Expr)** -- Attempted to keep activations resident in SMEM between up/down projections via a long-running while-loop queue, but suffered a **2.5x performance penalty** due to systemic L2 cache thrashing and atomic contention overheads natively blocking the streaming multiprocessors.
+5. - [x] **Hardware Async DMA Pipelining** -- Reverted to native Grid Dispatching, inserting double-buffered `__pipeline_memcpy_async` instructions to completely jump over the Register-File bottleneck, moving tensor payloads natively from Global -> Shared.
+6. - [x] **`float4` Vectorized Fetches** -- Upgraded the scalar `cp.async` pipeline into exact 128-bit chunks, restoring native coalesced memory alignment and breaking the 35ms bounds. Included an exact $+4$ padding technique across multi-dimensional arrays mapping to Bank Conflict avoidance. 
+7. - [x] **TF32 Tensor Cores (Opt 7)** -- Integrated `<mma.h>` native `wmma::precision::tf32` Tensor Blocks into the async pipe.
+- **Result:** We completely obliterated the compute loop, bringing math execution time down to nanoseconds! However, due to tiny `16x16` framework TILE_SIZE allocations, the Kernel is completely **Latency Bound**, starving the Streaming Multiprocessors. The true path to scale requires feeding `128x128` blocks to satiate the Blackwell DMA schedulers!
 
 ### DSA Kernel Optimizations
 

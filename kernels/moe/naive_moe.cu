@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <vector>
 #include <algorithm>
+#include <mma.h>
 
 #define TILE_SIZE 16
 
@@ -897,10 +898,14 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
     // Bs padded by 4 floats (16 bytes) to maintain float4 alignment while shifting SMEM banks
     __shared__ float As[2][TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 4];
+    __shared__ float Cs[TILE_SIZE][TILE_SIZE];
 
-    float sum = 0.0f;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float> c_frag;
+    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+
     int numTiles = (D + TILE_SIZE - 1) / TILE_SIZE;
     int tid = threadIdx.y * TILE_SIZE + threadIdx.x;
+    int warp_id = tid / 32;
 
     // --- PROLOGUE: Async Prefetch Tile 0 ---
     {
@@ -984,16 +989,34 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
         __pipeline_wait_prior(0);
         __syncthreads();
 
-        // Compute Tile N from SMEM registers
-        #pragma unroll
-        for (int i = 0; i < TILE_SIZE; i++) {
-            // As is [TILE_SIZE][TILE_SIZE]. threadIdx.y is output token row.
-            // Bs is [TILE_SIZE][TILE_SIZE+4]. threadIdx.x is output expert channel. W_e is [N, D].
-            sum += As[curr_buf][threadIdx.y][i] * Bs[curr_buf][threadIdx.x][i];
+        // TF32 Tensor Core Math (Assigned to Warp 0)
+        if (warp_id == 0) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_frag1;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_frag2;
+
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::col_major> b_frag1;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::col_major> b_frag2;
+
+            nvcuda::wmma::load_matrix_sync(a_frag1, &As[curr_buf][0][0], TILE_SIZE);
+            nvcuda::wmma::load_matrix_sync(a_frag2, &As[curr_buf][0][8], TILE_SIZE);
+            
+            nvcuda::wmma::load_matrix_sync(b_frag1, &Bs[curr_buf][0][0], TILE_SIZE + 4);
+            nvcuda::wmma::load_matrix_sync(b_frag2, &Bs[curr_buf][0][8], TILE_SIZE + 4);
+
+            nvcuda::wmma::mma_sync(c_frag, a_frag1, b_frag1, c_frag);
+            nvcuda::wmma::mma_sync(c_frag, a_frag2, b_frag2, c_frag);
         }
         __syncthreads(); 
     }
     
+    // Distribute results safely from Warp 0 across the entire block
+    if (warp_id == 0) {
+        nvcuda::wmma::store_matrix_sync(&Cs[0][0], c_frag, TILE_SIZE, nvcuda::wmma::mem_row_major);
+    }
+    __syncthreads();
+    
+    float sum = Cs[threadIdx.y][threadIdx.x];
+
     // --- EPILOGUE: Write Result ---
     if (row_within_e_base + threadIdx.y < expert_total_rows && global_col_base + threadIdx.x < N) {
         C[(global_row_base + threadIdx.y) * N + (global_col_base + threadIdx.x)] = sum;
