@@ -60,11 +60,7 @@ While highly elegant, eliminating intermediate global memory completely, **it se
 Optimization 5 details the critical findings while targeting optimal Blackwell B200 execution, addressing the latency barriers that Grouped GEMMs exhibit on large expert counts.
 
 ### The Persistent Thread Trap
-Initially, we assumed that even with Grouped GEMMs, assigning blocks across massive expert grids was incurring CTA hardware scheduling overheads. We designed a **Persistent Thread Pattern**: allocating a fixed grid of 640 CTAs locking into an atomic work queue. 
-
-**Result: 2.5x Performance Degradation.**
-
-By tracking metrics through Nsight Compute, we uncovered that CTA launch overhead at the 35ms timescale was a ghost (costing roughly 0.02% of the runtime). More importantly: sweeping 32GB of $W_1$ and $W_2$ weights via random persistent assignments broke the hardware L2 Cache localities, hammering the Memory Controller. The bottleneck on Blackwell isn't the dispatch—it's the DRAM bandwidth. 
+Initially, we assumed that even with Grouped GEMMs, assigning blocks across massive expert grids was incurring CTA hardware scheduling overheads. We designed a **Persistent Thread Pattern**: allocating a fixed number of blocks that loop over the expert queue (the runtime). More importantly: sweeping 32GB of $W_1$ and $W_2$ weights via random persistent assignments broke the hardware L2 Cache localities, hammering the Memory Controller. The bottleneck on Blackwell isn't the dispatch—it's the DRAM bandwidth. 
 
 ### The Solution: Direct Global-to-Shared DMA
 Optimization 5 (`grouped_gemm_blackwell_async_kernel`) drops the Persistent Thread model and leverages true hardware asynchronous copies (`cuda::pipeline` / `cp.async`).
@@ -88,6 +84,66 @@ To fix the structural alignment breakdown, Optimization 6 scales the memory pipe
 
 ### The Win
 **Latency reduced to 41.9ms.** Spatial memory bandwidth is completely restored. But we are formally COMPUTE-BOUND on FP32 CUDA cores executing $83 \text{ million}$ scalar multiplications! 
+
+---
+
+# MoE Kernel Optimization Journey (Blackwell B200)
+
+This document chronicles the transition from standard latency-bound kernels to the production-standard **DeepSeek-V3** Mixture-of-Experts architecture on NVIDIA Blackwell GPUs.
+
+### Final Results: DeepSeek-V3 (Blackwell B200)
+
+The following metrics represent the production **DeepSeek-V3 MoE** implementation (fused sigmoid-bias-group routing + 64x64 Union-Tiled GEMM).
+
+| Variant | Config (E=256, K=8, D=7k, I=2k) | Min Latency | Mean Latency | Throughput |
+| :--- | :--- | :--- | :--- | :--- |
+| **DeepSeek-V3** | T=64 | 2.96 ms | 3.00 ms | 21,343 Tok/s |
+| **DeepSeek-V3** | T=128 | 2.70 ms | 3.46 ms | 36,971 Tok/s |
+| **DeepSeek-V3** | T=512 | 6.77 ms | 7.22 ms | 70,899 Tok/s |
+| **DeepSeek-V3** | T=1024 | 13.61 ms | 13.75 ms | 74,470 Tok/s |
+| **DeepSeek-V3** | T=4096 | 45.38 ms | 46.54 ms | **88,004 Tok/s** |
+
+---
+
+## Summary: The Optimization Journey
+
+| Version | Key Innovation | Throughput (T=4k) | Latency (T=64) |
+| :--- | :--- | :--- | :--- |
+| **Opt 2** | Naive Grouped GEMM | 4,200 Tok/s | 65.0 ms |
+| **Opt 3** | Cooperative Tiling (32x32) | 48,000 Tok/s | 12.5 ms |
+| **Opt 5** | Union Overlay (64x64) | 85,000 Tok/s | 4.4 ms |
+| **DeepSeek-V3** | **Integrated Production Routing** | **88,004 Tok/s** | **2.9 ms** |
+
+---
+
+## DeepSeek-V3 Integration: Production Routing
+
+With the GEMM engine optimized (Opt5/Opt8), the final integration step was implementing 
+the **DeepSeek-V3 "Auxiliary Loss Free"** routing algorithm, which differs fundamentally 
+from standard softmax-based MoE gating.
+
+### The DeepSeek-V3 Routing Algorithm
+DeepSeek-V3 uses a **Sigmoid + Bias + Grouped Selection** pipeline:
+
+1. **Sigmoid Gating:** Each expert receives an independent sigmoid probability 
+   `s(e) = σ(x · W_g[e])`, rather than a global softmax.
+   
+2. **Bias-Adjusted Scoring:** A per-expert learned bias `b[e]` is added: 
+   `s_wb(e) = s(e) + b[e]`. These biases enable load balancing without auxiliary losses.
+
+3. **Grouped Expert Pruning:** Experts are divided into 8 groups of 32. 
+   Each group is scored by the sum of its top-2 biased scores. Only the top-4 groups survive.
+
+4. **Global Top-K:** From the 128 survivors, the top K=8 experts are selected by $s_{wb}$.
+
+5. **Weight Normalization:** Final weights use *raw sigmoid scores* ($s$), normalized 
+   across the selected K experts and scaled by `routed_scaling_factor`.
+
+### Implementation: `fused_gate_deepseek_kernel`
+- **Location:** `kernels/moe/naive_moe.cu`
+- **Parallel Sigmoid:** Expert dot-products are parallelized across 256 threads per token.
+- **Vectorized Reorder:** The `group_reorder_kernel` uses `float4` vectorized collaborative copying, 
+  reducing token movement latency from 4.3ms to 2.9ms for small batches.
 
 ---
 

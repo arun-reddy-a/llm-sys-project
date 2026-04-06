@@ -10,14 +10,15 @@ MOE_SRC = kernels/moe/naive_moe.cu
 
 # Targets
 TEST_MOE  = $(BUILD_DIR)/test_moe
+TEST_DEEPSEEK = $(BUILD_DIR)/test_deepseek
 BENCH_MOE = $(BUILD_DIR)/bench_moe
 SIMPLE_VADD = $(BUILD_DIR)/simple_vadd
 
-.PHONY: all tests benchmarks test bench clean debug_tests profile_vadd_nsys profile_vadd_ncu check_tools
+.PHONY: all tests benchmarks test bench clean debug_tests profile_vadd_nsys profile_vadd_ncu check_tools test_deepseek
 
 all: tests benchmarks
 
-tests: $(TEST_MOE)
+tests: $(TEST_MOE) $(TEST_DEEPSEEK)
 
 benchmarks: $(BENCH_MOE)
 
@@ -28,6 +29,9 @@ $(BUILD_DIR):
 
 $(TEST_MOE): tests/test_moe.cu $(MOE_SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_moe.cu $(MOE_SRC)
+
+$(TEST_DEEPSEEK): tests/test_moe_deepseek.cu $(MOE_SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_moe_deepseek.cu $(MOE_SRC)
 
 $(BENCH_MOE): benchmarks/bench_moe.cu $(MOE_SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/bench_moe.cu $(MOE_SRC)
@@ -46,6 +50,10 @@ test: tests
 	@echo "  Running MoE tests"
 	@echo "==============================="
 	./$(TEST_MOE)
+	./$(TEST_DEEPSEEK)
+
+test_deepseek: $(TEST_DEEPSEEK)
+	./$(TEST_DEEPSEEK)
 
 bench: benchmarks
 	@echo "==============================="
