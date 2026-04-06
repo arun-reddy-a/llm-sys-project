@@ -6,56 +6,40 @@
 
 #define DOT_TILE 128
 #define MAX_HEADS_PER_THREAD 8
-
 // ===================================================================
-// Kernel: KV gather – compressed
+// Kernel: fused KV/V gather
+//   One block gathers one selected KV entry for one query. Threads
+//   cooperatively copy the compressed key, positional key, and value
+//   slices after loading the sparse index once.
 // ===================================================================
-__global__ void kv_gather_compressed_kernel(const float* kv_cache, const int* indices,
-                                            float* out, int Q, int S, int Dc) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = Q * S * Dc;
-    if (tid >= total) return;
+__global__ void kv_gather_fused_kernel(const float* __restrict__ kv_cache_compressed,
+                                       const float* __restrict__ kv_cache_positional,
+                                       const float* __restrict__ v_cache,
+                                       const int* __restrict__ indices,
+                                       float* __restrict__ out_kc,
+                                       float* __restrict__ out_kp,
+                                       float* __restrict__ out_v,
+                                       int Q, int S, int Dc, int Dp) {
+    int qs = blockIdx.x;
+    if (qs >= Q * S) return;
 
-    int d = tid % Dc;
-    int s = (tid / Dc) % S;
-    int q = tid / (S * Dc);
+    int q = qs / S;
+    int s = qs % S;
+    int tid = threadIdx.x;
 
     int kv_idx = indices[q * S + s];
-    out[tid] = kv_cache[kv_idx * Dc + d];
-}
+    int kc_src = kv_idx * Dc;
+    int kp_src = kv_idx * Dp;
+    int out_kc_base = qs * Dc;
+    int out_kp_base = qs * Dp;
 
-// ===================================================================
-// Kernel: KV gather – positional
-// ===================================================================
-__global__ void kv_gather_positional_kernel(const float* kv_cache, const int* indices,
-                                            float* out, int Q, int S, int Dp) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = Q * S * Dp;
-    if (tid >= total) return;
-
-    int d = tid % Dp;
-    int s = (tid / Dp) % S;
-    int q = tid / (S * Dp);
-
-    int kv_idx = indices[q * S + s];
-    out[tid] = kv_cache[kv_idx * Dp + d];
-}
-
-// ===================================================================
-// Kernel: V gather
-// ===================================================================
-__global__ void v_gather_kernel(const float* v_cache, const int* indices,
-                                float* out, int Q, int S, int Dc) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = Q * S * Dc;
-    if (tid >= total) return;
-
-    int d = tid % Dc;
-    int s = (tid / Dc) % S;
-    int q = tid / (S * Dc);
-
-    int kv_idx = indices[q * S + s];
-    out[tid] = v_cache[kv_idx * Dc + d];
+    for (int d = tid; d < Dc; d += blockDim.x) {
+        out_kc[out_kc_base + d] = kv_cache_compressed[kc_src + d];
+        out_v[out_kc_base + d] = v_cache[kc_src + d];
+    }
+    for (int d = tid; d < Dp; d += blockDim.x) {
+        out_kp[out_kp_base + d] = kv_cache_positional[kp_src + d];
+    }
 }
 
 // ===================================================================
@@ -273,16 +257,20 @@ __global__ void dot_fused_tiled_kernel(const float* __restrict__ q_nope,
 }
 
 // ===================================================================
-// Kernel: softmax over S per (q, h) – one thread per (q, h)
+// Kernel: scaled softmax over S per (q, h) – one thread per (q, h)
 // ===================================================================
-__global__ void softmax_kernel(float* scores, int Q, int H, int S) {
+__global__ void scaled_softmax_kernel(float* scores, float scale, int Q, int H, int S) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= Q * H) return;
 
     float* row = scores + tid * S;
 
     float mx = -FLT_MAX;
-    for (int s = 0; s < S; s++) mx = fmaxf(mx, row[s]);
+    for (int s = 0; s < S; s++) {
+        float scaled = row[s] * scale;
+        row[s] = scaled;
+        mx = fmaxf(mx, scaled);
+    }
 
     float sum = 0.0f;
     for (int s = 0; s < S; s++) {
@@ -291,6 +279,53 @@ __global__ void softmax_kernel(float* scores, int Q, int H, int S) {
     }
     float inv = 1.0f / sum;
     for (int s = 0; s < S; s++) row[s] *= inv;
+}
+
+// ===================================================================
+// Kernel: block-parallel scaled softmax over S per (q, h)
+//   One block owns one row. Threads cooperatively compute the max,
+//   exponentials, sum, and normalization for long rows.
+// ===================================================================
+__global__ void scaled_softmax_block_kernel(float* scores, float scale, int rows, int S) {
+    int row_idx = blockIdx.x;
+    if (row_idx >= rows) return;
+
+    float* row = scores + row_idx * S;
+    int tid = threadIdx.x;
+
+    __shared__ float red[256];
+
+    float thread_max = -FLT_MAX;
+    for (int s = tid; s < S; s += blockDim.x) {
+        float scaled = row[s] * scale;
+        row[s] = scaled;
+        thread_max = fmaxf(thread_max, scaled);
+    }
+    red[tid] = thread_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] = fmaxf(red[tid], red[tid + stride]);
+        __syncthreads();
+    }
+    float mx = red[0];
+
+    float thread_sum = 0.0f;
+    for (int s = tid; s < S; s += blockDim.x) {
+        float ex = expf(row[s] - mx);
+        row[s] = ex;
+        thread_sum += ex;
+    }
+    red[tid] = thread_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) red[tid] += red[tid + stride];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / red[0];
+
+    for (int s = tid; s < S; s += blockDim.x) row[s] *= inv_sum;
 }
 
 // ===================================================================
@@ -316,14 +351,6 @@ __global__ void output_proj_kernel(const float* attn, const float* v,
 }
 
 // ===================================================================
-// Kernel: element-wise scale
-// ===================================================================
-__global__ void scale_kernel(float* data, float scale, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) data[i] *= scale;
-}
-
-// ===================================================================
 // Host wrappers
 // ===================================================================
 
@@ -342,28 +369,11 @@ void dsa_kv_gather(const float* kv_cache_compressed,
     int Q = cfg.num_queries, S = cfg.num_selected_kv;
     int Dc = cfg.head_dim_compressed, Dp = cfg.head_dim_positional;
     int threads = 256;
-
-    {
-        int n = Q * S * Dc;
-        int blocks = (n + threads - 1) / threads;
-        kv_gather_compressed_kernel<<<blocks, threads, 0, stream>>>(
-            kv_cache_compressed, sparse_indices, gathered_kc, Q, S, Dc);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    {
-        int n = Q * S * Dp;
-        int blocks = (n + threads - 1) / threads;
-        kv_gather_positional_kernel<<<blocks, threads, 0, stream>>>(
-            kv_cache_positional, sparse_indices, gathered_kp, Q, S, Dp);
-        CUDA_CHECK(cudaGetLastError());
-    }
-    {
-        int n = Q * S * Dc;
-        int blocks = (n + threads - 1) / threads;
-        v_gather_kernel<<<blocks, threads, 0, stream>>>(
-            v_cache, sparse_indices, gathered_v, Q, S, Dc);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    int blocks = Q * S;
+    kv_gather_fused_kernel<<<blocks, threads, 0, stream>>>(
+        kv_cache_compressed, kv_cache_positional, v_cache, sparse_indices,
+        gathered_kc, gathered_kp, gathered_v, Q, S, Dc, Dp);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void dsa_dot_compressed(const float* q_nope, const float* kc, float* scores,
@@ -408,12 +418,19 @@ void dsa_dot_fused(const float* q_nope, const float* q_pe,
     CUDA_CHECK(cudaGetLastError());
 }
 
-void dsa_softmax(float* scores, const DsaConfig& cfg, cudaStream_t stream) {
+void dsa_scaled_softmax(float* scores, float scale,
+                        const DsaConfig& cfg, cudaStream_t stream) {
     int total = cfg.num_queries * cfg.num_heads;
-    int threads = 256;
-    int blocks = (total + threads - 1) / threads;
-    softmax_kernel<<<blocks, threads, 0, stream>>>(
-        scores, cfg.num_queries, cfg.num_heads, cfg.num_selected_kv);
+    if (cfg.num_selected_kv >= 512) {
+        int threads = 256;
+        scaled_softmax_block_kernel<<<total, threads, 0, stream>>>(
+            scores, scale, total, cfg.num_selected_kv);
+    } else {
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        scaled_softmax_kernel<<<blocks, threads, 0, stream>>>(
+            scores, scale, cfg.num_queries, cfg.num_heads, cfg.num_selected_kv);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -451,8 +468,7 @@ void dsa_forward_naive(const float* q_nope, const float* q_pe,
     dot_positional_kernel<<<(Q*H*S+255)/256, 256, 0, stream>>>(q_pe, kp.ptr, scores.ptr, Q, H, S, Dp);
 
     float sc = 1.0f / sqrtf((float)(Dc + Dp));
-    scale_kernel<<<(Q*H*S+255)/256, 256, 0, stream>>>(scores.ptr, sc, Q*H*S);
-    dsa_softmax(scores.ptr, cfg, stream);
+    dsa_scaled_softmax(scores.ptr, sc, cfg, stream);
     dsa_output_proj(scores.ptr, v.ptr, output, cfg, stream);
 }
 
@@ -478,8 +494,7 @@ void dsa_forward_opt1(const float* q_nope, const float* q_pe,
     dsa_dot_positional(q_pe, kp.ptr, scores.ptr, cfg, stream);
 
     float sc = 1.0f / sqrtf((float)(Dc + Dp));
-    scale_kernel<<<(Q*H*S+255)/256, 256, 0, stream>>>(scores.ptr, sc, Q*H*S);
-    dsa_softmax(scores.ptr, cfg, stream);
+    dsa_scaled_softmax(scores.ptr, sc, cfg, stream);
     dsa_output_proj(scores.ptr, v.ptr, output, cfg, stream);
 }
 
@@ -504,8 +519,7 @@ void dsa_forward_opt2(const float* q_nope, const float* q_pe,
     dsa_dot_fused(q_nope, q_pe, kc.ptr, kp.ptr, scores.ptr, cfg, stream);
 
     float sc = 1.0f / sqrtf((float)(Dc + Dp));
-    scale_kernel<<<(Q*H*S+255)/256, 256, 0, stream>>>(scores.ptr, sc, Q*H*S);
-    dsa_softmax(scores.ptr, cfg, stream);
+    dsa_scaled_softmax(scores.ptr, sc, cfg, stream);
     dsa_output_proj(scores.ptr, v.ptr, output, cfg, stream);
 }
 
