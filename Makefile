@@ -1,5 +1,5 @@
 NVCC       ?= nvcc
-NVCC_FLAGS  = -std=c++17 -O2 -arch=native
+NVCC_FLAGS  = -std=c++17 -O3 -arch=native -lcublas -lnvToolsExt
 DEBUG_FLAGS = -std=c++17 -G -g -arch=native
 
 BUILD_DIR  = build

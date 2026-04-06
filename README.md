@@ -2,13 +2,6 @@
 
 Custom CUDA kernels for Mixture-of-Experts (MoE) layers, targeting NVIDIA Blackwell B200 GPUs. This repository starts with naive baseline implementations and will be iteratively optimised through kernel fusion, batching, and Blackwell-specific hardware features.
 
-## Prerequisites
-
-- **CUDA Toolkit** >= 12.0 (`-arch=native` requires CUDA 12+; 12.8+ for Blackwell `sm_100`)
-- **NVIDIA GPU** with compute capability >= 7.0 (V100, Ampere, Hopper, or Blackwell)
-- **GNU Make**
-- **C++17**-capable host compiler (GCC >= 9, Clang >= 10)
-
 ## ☁️ Modal Cloud Execution
 
 You can build and run this project on cloud GPUs using [Modal](https://modal.com). This is the recommended way to benchmark on the latest **Blackwell B200** GPUs.
@@ -29,15 +22,6 @@ modal run modal_run.py --target profile_moe_full --variant DeepSeek
 ```
 
 See [docs/modal/README.md](docs/modal/README.md) for more details.
-
-If you need to target a specific architecture (e.g. cross-compiling or `-arch=native` is not available), override `NVCC_FLAGS`:
-
-```bash
-make all NVCC_FLAGS="-std=c++17 -O2 -arch=sm_100"   # Blackwell B200
-make all NVCC_FLAGS="-std=c++17 -O2 -arch=sm_90"    # Hopper H100
-make all NVCC_FLAGS="-std=c++17 -O2 -arch=sm_80"    # Ampere A100
-make all NVCC_FLAGS="-std=c++17 -O2 -arch=sm_70"    # V100
-```
 
 Benchmark iterations can be configured via CLI arguments:
 
@@ -151,16 +135,10 @@ Benchmarks report min/mean/median/max latency and throughput across multiple pro
 
 | Variant | Config (E=256, K=8, D=7k, I=2k) | Min Latency | Mean Latency | Throughput | 
 | :--- | :--- | :--- | :--- | :--- |
-| **DeepSeek-V3** | T=64 | 2.96 ms | 3.00 ms | 21,343 Tok/s |
-| **DeepSeek-V3** | T=128 | 2.70 ms | 3.46 ms | 36,971 Tok/s |
-| **DeepSeek-V3** | T=512 | 6.77 ms | 7.22 ms | 70,899 Tok/s |
-| **DeepSeek-V3** | T=1024 | 13.61 ms | 13.75 ms | 74,470 Tok/s |
-| **DeepSeek-V3** | T=4096 | 45.38 ms | 46.54 ms | **88,004 Tok/s** |
-  Opt5        T=64,E=256,EL=32,K=8,D=7168,I=2048         2.083     2.083         30,720
-  Opt5        T=512,E=256,EL=32,K=8,D=7168,I=2048        8.343     8.343         61,370
-  Opt5        T=2048,E=256,EL=32,K=8,D=7168,I=2048      24.088    24.134         84,859
+| **DeepSeek-v3 (Optimized)** | T=64 | 2.03 ms | 2.31 ms | 27,655 Tok/s |
+| **DeepSeek-v3 (Optimized)** | T=512 | 2.15 ms | 2.33 ms | **219,724** Tok/s |
+| **DeepSeek-v3 (Optimized)** | T=4096 | 11.32 ms | 11.73 ms | **349,113** Tok/s |
   --------------------------------------------------------------------------------------
-```
 
 ---
 

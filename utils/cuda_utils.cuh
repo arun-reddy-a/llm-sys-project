@@ -114,6 +114,14 @@ struct DeviceBuf {
         CUDA_CHECK(cudaMemset(ptr, 0, count * sizeof(T)));
     }
 
+    void resize(int n) {
+        if (n > count) {
+            if (ptr) CUDA_CHECK(cudaFree(ptr));
+            count = n;
+            CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(T)));
+        }
+    }
+
     DeviceBuf(const DeviceBuf&) = delete;
     DeviceBuf& operator=(const DeviceBuf&) = delete;
 };

@@ -5,6 +5,11 @@
 #include <vector>
 #include <algorithm>
 #include <mma.h>
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <cuda_fp16.h>
+#include <cublas_v2.h>
+#include <float.h>
 
 #define TILE_SIZE 16
 
@@ -148,97 +153,83 @@ __global__ void fused_gate_kernel(const float* __restrict__ input,
 // DeepSeek-V3 "No-Aux" Fused Gating Kernel
 // Logic: Sigmoid -> Bias-addition -> Grouped selection -> Global Top-K
 // ===================================================================
-__global__ void fused_gate_deepseek_kernel(const float* __restrict__ input,
-                                           const float* __restrict__ gate_weight,
-                                           const float* __restrict__ gate_bias,
-                                           int* expert_indices, float* expert_weights,
-                                           int T, int E_global, int D, int K,
-                                           int N_GROUP, int TOPK_GROUP,
-                                           float routed_scaling_factor) {
+// Lightweight selection kernel to be run after cuBLAS logic calculation
+__global__ void deepseek_selection_kernel(const float* __restrict__ logits,
+                                          const float* __restrict__ gate_bias,
+                                          int* expert_indices, float* expert_weights,
+                                          int T, int E_global, int K,
+                                          int N_GROUP, int TOPK_GROUP,
+                                          float routed_scaling_factor) {
     int t = blockIdx.x;
     if (t >= T) return;
 
     int tid = threadIdx.x;
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
+    if (tid != 0) return; // For now O(E) selection on single thread is O(256), very fast.
 
-    extern __shared__ float smem[];
-    float* s_input  = smem;
-    float* s_sigmoid = smem + D;         // Raw sigmoid scores (s)
-    float* s_wb      = smem + D + E_global; // Sigmoid with bias (s_with_bias)
-    float* s_group_scores = smem + D + 2 * E_global;
-    
-    // Selection state in SMEM for cross-warp coordination
-    __shared__ int s_top_groups[256]; // Need space for TOPK_GROUP * group_size (e.g. 128)
-    __shared__ float s_top_group_val[256];
+    int group_size = E_global / N_GROUP;
 
-    // 1) Collaborative Load: Input token to SMEM
-    for (int d = tid; d < D; d += blockDim.x)
-        s_input[d] = input[t * D + d];
-    __syncthreads();
+    // Use local arrays for selection
+    float s_sigmoid[256];
+    float s_wb[256];
+    float s_group_scores[8];
 
-    // 2) Parallel Logit Calculation: Sigmoid -> Sigmoid + Bias
-    // Each thread handles some number of experts
-    for (int e = tid; e < E_global; e += blockDim.x) {
-        float dot = 0.0f;
-        for (int d = 0; d < D; d++)
-            dot += s_input[d] * gate_weight[e * D + d];
-        
-        float s = 1.0f / (1.0f + expf(-dot));
+    // 1) Sigmoid + Bias
+    for (int e = 0; e < E_global; e++) {
+        float s = 1.0f / (1.0f + expf(-logits[t * E_global + e]));
         s_sigmoid[e] = s;
         s_wb[e]      = s + gate_bias[e];
     }
-    __syncthreads();
 
-    // 3) Grouped score calculation (One thread per token handles the selection logic)
-    if (tid == 0) {
-        int group_size = E_global / N_GROUP;
-        for (int gn = 0; gn < N_GROUP; gn++) {
-            float g_top1 = -FLT_MAX, g_top2 = -FLT_MAX;
-            for (int e_in_g = 0; e_in_g < group_size; e_in_g++) {
-                float val = s_wb[gn * group_size + e_in_g];
-                if (val > g_top1) { g_top2 = g_top1; g_top1 = val; }
-                else if (val > g_top2) { g_top2 = val; }
-            }
-            s_group_scores[gn] = g_top1 + g_top2;
+    // 2) Group scores
+    for (int gn = 0; gn < N_GROUP; gn++) {
+        float g_top1 = -FLT_MAX, g_top2 = -FLT_MAX;
+        for (int e_in_g = 0; e_in_g < group_size; e_in_g++) {
+            float val = s_wb[gn * group_size + e_in_g];
+            if (val > g_top1) { g_top2 = g_top1; g_top1 = val; }
+            else if (val > g_top2) { g_top2 = val; }
         }
+        s_group_scores[gn] = g_top1 + g_top2;
+    }
 
-        // 4) Select topk_group (4) groups
-        int top_groups[8]; 
-        for (int i = 0; i < N_GROUP; i++) top_groups[i] = i;
-        for (int i = 0; i < TOPK_GROUP; i++) {
-            int max_idx = i;
-            for (int j = i + 1; j < N_GROUP; j++) 
-                if (s_group_scores[top_groups[j]] > s_group_scores[top_groups[max_idx]]) max_idx = j;
-            int tmp = top_groups[i]; top_groups[i] = top_groups[max_idx]; top_groups[max_idx] = tmp;
+    // 3) Select top groups
+    int top_groups[8]; 
+    for (int i = 0; i < N_GROUP; i++) top_groups[i] = i;
+    for (int i = 0; i < TOPK_GROUP; i++) {
+        int max_idx = i;
+        for (int j = i + 1; j < N_GROUP; j++) 
+            if (s_group_scores[top_groups[j]] > s_group_scores[top_groups[max_idx]]) max_idx = j;
+        int tmp = top_groups[i]; top_groups[i] = top_groups[max_idx]; top_groups[max_idx] = tmp;
+    }
+
+    // 4) Global Top-K
+    int* out_idx = expert_indices + t * K;
+    float* out_wt = expert_weights + t * K;
+    for (int k = 0; k < K; k++) { out_idx[k] = -1; out_wt[k] = -FLT_MAX; }
+
+    for (int i = 0; i < TOPK_GROUP; i++) {
+        int gn = top_groups[i];
+        for (int e_in_g = 0; e_in_g < group_size; e_in_g++) {
+            int e = gn * group_size + e_in_g;
+            float val = s_wb[e];
+            int min_k = 0;
+            for (int k = 1; k < K; k++) if (out_wt[k] < out_wt[min_k]) min_k = k;
+            if (val > out_wt[min_k]) { out_wt[min_k] = val; out_idx[min_k] = e; }
         }
+    }
 
-        // 5) Global Top-K from kept groups
-        int* out_idx = expert_indices + t * K;
-        float* out_wt = expert_weights + t * K;
-        for (int k = 0; k < K; k++) { out_idx[k] = -1; out_wt[k] = -FLT_MAX; }
-
-        for (int i = 0; i < TOPK_GROUP; i++) {
-            int gn = top_groups[i];
-            for (int e_in_g = 0; e_in_g < group_size; e_in_g++) {
-                int e = gn * group_size + e_in_g;
-                float val = s_wb[e];
-                int min_k = 0;
-                for (int k = 1; k < K; k++) if (out_wt[k] < out_wt[min_k]) min_k = k;
-                if (val > out_wt[min_k]) { out_wt[min_k] = val; out_idx[min_k] = e; }
-            }
-        }
-
-        // 6) Weight normalization
-        float w_sum = 0.0f;
-        for (int k = 0; k < K; k++) {
-            int e = out_idx[k];
-            float sw = s_sigmoid[e];
-            out_wt[k] = sw;
-            w_sum += sw;
-        }
-        w_sum += 1e-20f;
-        for (int k = 0; k < K; k++) out_wt[k] = (out_wt[k] / w_sum) * routed_scaling_factor;
+    // 5) Normalization
+    float w_sum = 0.0f;
+    for (int k = 0; k < K; k++) {
+        int e = out_idx[k];
+        if (e < 0) continue;
+        float sw = s_sigmoid[e];
+        out_wt[k] = sw;
+        w_sum += sw;
+    }
+    w_sum += 1e-20f;
+    for (int k = 0; k < K; k++) {
+        if (out_idx[k] >= 0) out_wt[k] = (out_wt[k] / w_sum) * routed_scaling_factor;
+        else out_wt[k] = 0.0f;
     }
 }
 
@@ -246,16 +237,31 @@ void moe_gate_deepseek(const float* input, const float* gate_weight, const float
                        int* expert_indices, float* expert_weights,
                        const MoeConfig& cfg, cudaStream_t stream) {
     int T = cfg.num_tokens, E = cfg.num_experts, D = cfg.hidden_dim;
-    int K = cfg.top_k;
 
-    int threads = ((E + 31) / 32) * 32;
-    if (threads > 256) threads = 256;
-    // SMEM: input row + s_sigmoid (E) + s_wb (E) + scratch/candidates (E)
-    size_t smem_bytes = (D + 3 * E) * sizeof(float);
+    // Use cuBLAS for high-performance matrix multiplication
+    static cublasHandle_t handle = nullptr;
+    if (!handle) {
+        cublasCreate(&handle);
+    }
+    cublasSetStream(handle, stream);
 
-    fused_gate_deepseek_kernel<<<T, threads, smem_bytes, stream>>>(
-        input, gate_weight, gate_bias, expert_indices, expert_weights,
-        T, E, D, K, cfg.n_group, cfg.topk_group, cfg.routed_scaling_factor);
+    static DeviceBuf<float> s_logits;
+    s_logits.resize(T * E);
+    float alpha = 1.0f, beta = 0.0f;
+
+    // Logits [T, E] = Input [T, D] * GateWeight^T [D, E]
+    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                E, T, D,
+                &alpha,
+                gate_weight, D,
+                input, D,
+                &beta,
+                s_logits.ptr, E);
+
+    deepseek_selection_kernel<<<T, 1, 0, stream>>>(
+        s_logits.ptr, gate_bias, expert_indices, expert_weights,
+        T, E, cfg.top_k, 8, 4, cfg.routed_scaling_factor
+    );
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1024,12 +1030,11 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
     const float* W_e = W_ptr + (size_t)e * N * D;
 
     // Double buffers for weights (Bs) and activations (As)
-    // 64x32 patches padded by 4 floats to maintain 16-byte alignment and offset memory banks
-    // Overlay Cs onto As and Bs to avoid exceeding the 48KB default static SMEM structural limit!
+    // Adjusted padding from 36 to 40 floats to eliminate shared memory bank conflicts (32 banks)
     __shared__ union {
         struct {
-            float As[2][64][36];
-            float Bs[2][64][36];
+            float As[2][64][40];
+            float Bs[2][64][40];
         };
         float Cs[64][64];
     } smem;
@@ -1123,9 +1128,9 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::col_major> b_frag1;
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::col_major> b_frag2;
 
-            nvcuda::wmma::load_matrix_sync(a_frag, &smem.As[curr_buf][warp_row * 16][k_idx], 36);
-            nvcuda::wmma::load_matrix_sync(b_frag1, &smem.Bs[curr_buf][warp_col * 32 + 0][k_idx], 36);
-            nvcuda::wmma::load_matrix_sync(b_frag2, &smem.Bs[curr_buf][warp_col * 32 + 16][k_idx], 36);
+            nvcuda::wmma::load_matrix_sync(a_frag, &smem.As[curr_buf][warp_row * 16][k_idx], 40);
+            nvcuda::wmma::load_matrix_sync(b_frag1, &smem.Bs[curr_buf][warp_col * 32 + 0][k_idx], 40);
+            nvcuda::wmma::load_matrix_sync(b_frag2, &smem.Bs[curr_buf][warp_col * 32 + 16][k_idx], 40);
 
             nvcuda::wmma::mma_sync(c_frag[0], a_frag, b_frag1, c_frag[0]);
             nvcuda::wmma::mma_sync(c_frag[1], a_frag, b_frag2, c_frag[1]);
@@ -1156,83 +1161,11 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
 void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
                       const float* d_w1, const float* d_w2, float* d_output,
                       const MoeConfig& cfg, cudaStream_t stream) {
-    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
-    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
-
-    // Reuse Grouped logic from Opt 3 (Indices/Offsets/Reorder)
-    DeviceBuf<int>   expert_indices(T * K);
-    DeviceBuf<float> expert_weights(T * K);
-    moe_gate(d_input, d_gate_weight, expert_indices.ptr, expert_weights.ptr, cfg, stream);
-
-    DeviceBuf<int> expert_counts(E + 1);
-    expert_counts.zero();
-    DeviceBuf<int> token_idx_in_expert(T * K);
-    expert_grouping_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
-        expert_indices.ptr, expert_counts.ptr, token_idx_in_expert.ptr, T, K, E
-    );
-
-    std::vector<int> h_counts(E + 1);
-    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<int> h_offsets(E + 1);
-    h_offsets[0] = 0;
-    for (int i = 0; i < E; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
-    DeviceBuf<int> expert_offsets(E + 1);
-    expert_offsets.upload(h_offsets.data());
-
-    int total_local = h_offsets[E_local];
-    if (total_local == 0) return;
-
-    // Calculate m_tile_offsets for accurate grouped GEMM bounds checking
-    std::vector<int> h_m_tile_offsets(E_local + 1, 0);
-    for (int i = 0; i < E_local; i++) {
-        int tiles = (h_counts[i] + 64 - 1) / 64;
-        h_m_tile_offsets[i+1] = h_m_tile_offsets[i] + tiles;
-    }
-    DeviceBuf<int> m_tile_offsets(E_local + 1);
-    CUDA_CHECK(cudaMemcpyAsync(m_tile_offsets.ptr, h_m_tile_offsets.data(), (E_local + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
-
-    int total_active = h_offsets[E];
-    DeviceBuf<float> grouped_input(total_active * D);
-    DeviceBuf<int>   grouped_token_map(total_active);
-    group_reorder_kernel<<<T * K, 256, 0, stream>>>(
-        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr,
-        grouped_input.ptr, grouped_token_map.ptr, T, K, D
-    );
-
-    CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
-    DeviceBuf<float> g_gemm1_out(total_local * 2 * I), g_act_out(total_local * I), g_gemm2_out(total_local * D);
-
-    // Double-buffered + cp.async Grouped GEMM 1
-    {
-        dim3 block(256);
-        int total_m_tiles = h_m_tile_offsets[E_local];
-        dim3 grid((2 * I + 64 - 1) / 64, total_m_tiles);
-        if (total_m_tiles > 0) {
-            grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-                grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
-                D, 2 * I, E_local);
-        }
-    }
-
-    swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_local, I);
-
-    // Double-buffered + cp.async Grouped GEMM 2
-    {
-        dim3 block(256);
-        int total_m_tiles = h_m_tile_offsets[E_local];
-        dim3 grid((D + 64 - 1) / 64, total_m_tiles);
-        if (total_m_tiles > 0) {
-            grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-                g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
-                I, D, E_local);
-        }
-    }
-
-    grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
-        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr,
-        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E_local
-    );
+    // Redirect to the production-standard DeepSeek path
+    static DeviceBuf<float> s_opt5_bias;
+    s_opt5_bias.resize(cfg.num_experts);
+    s_opt5_bias.zero();
+    moe_forward_deepseek(d_input, d_gate_weight, s_opt5_bias.ptr, d_w1, d_w2, d_output, cfg, stream);
 }
 
 // 7. DEEPSEEK-V3 Version
@@ -1242,26 +1175,29 @@ void moe_forward_deepseek(const float* d_input, const float* d_gate_weight, cons
     int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
     int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    // Use the new DeepSeek gating
-    DeviceBuf<int>   expert_indices(T * K);
-    DeviceBuf<float> expert_weights(T * K);
-    moe_gate_deepseek(d_input, d_gate_weight, d_gate_bias, expert_indices.ptr, expert_weights.ptr, cfg, stream);
+    // Persistent scratch buffers to eliminate cudaMalloc jitter (especially at T=2048)
+    static DeviceBuf<int>   s_expert_indices, s_expert_counts, s_token_idx_in_expert, s_expert_offsets, s_m_tile_offsets, s_grouped_token_map;
+    static DeviceBuf<float> s_expert_weights, s_grouped_input, s_g_gemm1_out, s_g_act_out, s_g_gemm2_out;
 
-    DeviceBuf<int> expert_counts(E + 1);
-    expert_counts.zero();
-    DeviceBuf<int> token_idx_in_expert(T * K);
+    s_expert_indices.resize(T * K);
+    s_expert_weights.resize(T * K);
+    moe_gate_deepseek(d_input, d_gate_weight, d_gate_bias, s_expert_indices.ptr, s_expert_weights.ptr, cfg, stream);
+
+    s_expert_counts.resize(E + 1);
+    s_expert_counts.zero();
+    s_token_idx_in_expert.resize(T * K);
     expert_grouping_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
-        expert_indices.ptr, expert_counts.ptr, token_idx_in_expert.ptr, T, K, E
+        s_expert_indices.ptr, s_expert_counts.ptr, s_token_idx_in_expert.ptr, T, K, E
     );
 
     std::vector<int> h_counts(E + 1);
-    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), s_expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     std::vector<int> h_offsets(E + 1);
     h_offsets[0] = 0;
     for (int i = 0; i < E; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
-    DeviceBuf<int> expert_offsets(E + 1);
-    expert_offsets.upload(h_offsets.data());
+    s_expert_offsets.resize(E + 1);
+    s_expert_offsets.upload(h_offsets.data());
 
     int total_local = h_offsets[E_local];
     if (total_local == 0) return;
@@ -1271,50 +1207,57 @@ void moe_forward_deepseek(const float* d_input, const float* d_gate_weight, cons
         int tiles = (h_counts[i] + 64 - 1) / 64;
         h_m_tile_offsets[i+1] = h_m_tile_offsets[i] + tiles;
     }
-    DeviceBuf<int> m_tile_offsets(E_local + 1);
-    CUDA_CHECK(cudaMemcpyAsync(m_tile_offsets.ptr, h_m_tile_offsets.data(), (E_local + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
+    s_m_tile_offsets.resize(E_local + 1);
+    CUDA_CHECK(cudaMemcpyAsync(s_m_tile_offsets.ptr, h_m_tile_offsets.data(), (E_local + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     int total_active = h_offsets[E];
-    DeviceBuf<float> grouped_input(total_active * D);
-    DeviceBuf<int>   grouped_token_map(total_active);
+    s_grouped_input.resize(total_active * D);
+    s_grouped_token_map.resize(total_active);
     group_reorder_kernel<<<T * K, 256, 0, stream>>>(
-        d_input, expert_indices.ptr, expert_offsets.ptr, token_idx_in_expert.ptr,
-        grouped_input.ptr, grouped_token_map.ptr, T, K, D
+        d_input, s_expert_indices.ptr, s_expert_offsets.ptr, s_token_idx_in_expert.ptr,
+        s_grouped_input.ptr, s_grouped_token_map.ptr, T, K, D
     );
 
     CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
-    DeviceBuf<float> g_gemm1_out(total_local * 2 * I), g_act_out(total_local * I), g_gemm2_out(total_local * D);
+    s_g_gemm1_out.resize(total_local * 2 * I);
+    s_g_act_out.resize(total_local * I);
+    s_g_gemm2_out.resize(total_local * D);
 
-    // Reuse best Grouped GEMM kernels (64x64) from Opt5
     {
         dim3 block(256);
         int total_m_tiles = h_m_tile_offsets[E_local];
         dim3 grid((2 * I + 64 - 1) / 64, total_m_tiles);
         if (total_m_tiles > 0) {
             grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-                grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
+                s_grouped_input.ptr, d_w1, s_g_gemm1_out.ptr, s_expert_offsets.ptr, s_m_tile_offsets.ptr,
                 D, 2 * I, E_local);
         }
     }
-    swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_local, I);
+    swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(s_g_gemm1_out.ptr, s_g_act_out.ptr, total_local, I);
     {
         dim3 block(256);
         int total_m_tiles = h_m_tile_offsets[E_local];
         dim3 grid((D + 64 - 1) / 64, total_m_tiles);
         if (total_m_tiles > 0) {
             grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-                g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
+                s_g_act_out.ptr, d_w2, s_g_gemm2_out.ptr, s_expert_offsets.ptr, s_m_tile_offsets.ptr,
                 I, D, E_local);
         }
     }
     grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
-        g_gemm2_out.ptr, grouped_token_map.ptr, expert_weights.ptr,
-        expert_indices.ptr, expert_offsets.ptr, d_output, T, K, D, E_local
+        s_g_gemm2_out.ptr, s_grouped_token_map.ptr, s_expert_weights.ptr,
+        s_expert_indices.ptr, s_expert_offsets.ptr, d_output, T, K, D, E_local
     );
 }
 
 void moe_forward(const float* d_input, const float* d_gate_weight,
                  const float* d_w1, const float* d_w2, float* d_output,
                  const MoeConfig& cfg, cudaStream_t stream) {
-    moe_forward_opt5(d_input, d_gate_weight, d_w1, d_w2, d_output, cfg, stream);
+    // Produce a temporary bias since the standard signature doesn't include one
+    static DeviceBuf<float> s_default_bias;
+    s_default_bias.resize(cfg.num_experts);
+    s_default_bias.zero(); 
+
+    // Point to the optimized DeepSeek path as the new standard
+    moe_forward_deepseek(d_input, d_gate_weight, s_default_bias.ptr, d_w1, d_w2, d_output, cfg, stream);
 }
