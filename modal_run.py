@@ -1,23 +1,35 @@
 import modal
 import os
-import subprocess
 import sys
+import json
+from datetime import datetime, timezone
 
-# Define the Modal App
+# ---------------------------------------------------------------------------
+# Modal Configuration:
+# - Target B200 GPU for Blackwell architecture.
+# - Use a CUDA-enabled development image.
+# - Mount the local workspace for access to kernels and benchmarks.
+# ---------------------------------------------------------------------------
+
+RESULTS_FILE = "results.jsonl"
+
 app = modal.App("llm-sys-kernels")
 
-# ---------------------------------------------------------------------------
-# Image Configuration — Built once and cached
-# ---------------------------------------------------------------------------
-# Using nvidia/cuda:12.8.0-devel-ubuntu22.04:
-# - Provides nvcc 12.8.
-# - Provides CUDA headers and libraries. 
-# - Includes developmental tools for kernels.
+# Image definition:
+# - Based on NVIDIA CUDA 12.8.1 with Ubuntu 24.04 (matching your mini-sglang env).
+# - Provides CUDA headers and libraries.
+# - Includes developmental tools for kernels and profiling.
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .apt_install("git", "build-essential", "wget", "gnupg")
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
+    .apt_install("git", "build-essential", "wget", "gnupg", "libnuma-dev", "libicu-dev", "software-properties-common")
     .run_commands(
-        "apt-get update && apt-get install -y nsight-systems-cli nsight-compute",
+        "rm -f /etc/apt/sources.list.d/cuda*.list",
+        "wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb",
+        "dpkg -i cuda-keyring_1.1-1_all.deb",
+        "apt-get update",
+        "apt-get install -y nsight-systems-2025.1.3 nsight-compute-2025.1.1",
+        "ln -sf /opt/nvidia/nsight-systems/2025.1.3/target-linux-x64/nsys /usr/local/bin/nsys",
+        "ln -sf /opt/nvidia/nsight-compute/2025.1.1/ncu /usr/local/bin/ncu",
     )
     # Add local project files into /workspace
     .add_local_dir(
@@ -27,80 +39,112 @@ image = (
     )
 )
 
-# ---------------------------------------------------------------------------
-# Remote GPU Execution
-# ---------------------------------------------------------------------------
+# Persist profiling results across runs
+results_vol = modal.Volume.from_name("llm-sys-profiling-results", create_if_missing=True)
+
+
+def log_result(target: str, result: dict):
+    """Append a structured JSON Lines entry to results.jsonl.
+    
+    Each line is a self-contained JSON object:
+    {
+        "timestamp": "2026-04-06T18:30:00Z",
+        "target": "bench_moe_smoke",
+        "exit_code": 0,
+        "gpu": "B200",
+        "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+        "stdout": "..."
+    }
+    """
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "target": target,
+        "exit_code": result["returncode"],
+        "gpu": "B200",
+        "image": "nvidia/cuda:12.8.1-devel-ubuntu24.04",
+        "stdout": result["stdout"],
+    }
+    with open(RESULTS_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 @app.function(
     image=image,
     gpu="B200:1",      # Target Blackwell GPU
+    volumes={"/workspace/profiling/results": results_vol},
     timeout=600,       # 10 min max run time
 )
 def run_make_target(target: str) -> dict:
     """Run a specific Makefile target in the remote container."""
     print(f"\n🚀 [modal] Executing: 'make {target}'")
-    print(f"   Environment: nvidia/cuda:12.8.0-devel-ubuntu22.04")
+    print(f"   Environment: nvidia/cuda:12.8.1-devel-ubuntu24.04")
     print(f"   GPU        : B200 (single)")
-    
-    # Run the make command in /workspace
-    # subprocess.run handles output streaming back to the caller's terminal.
-    result = subprocess.run(
+
+    # Run the make command in /workspace and stream output
+    import subprocess
+    import sys
+
+    process = subprocess.Popen(
         ["make", target],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
         cwd="/workspace",
-        capture_output=True,
-        text=True
+        bufsize=1
     )
-    
-    if result.returncode == 0:
-        print(f"   ✅ Target '{target}' PASSED.")
-    else:
-        print(f"   ❌ Target '{target}' FAILED (exit code {result.returncode}).")
-        
+
+    full_output = []
+    print(f"--- START OUTPUT for 'make {target}' ---")
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        full_output.append(line)
+    process.wait()
+    print(f"\n--- END OUTPUT (Exit Code: {process.returncode}) ---")
+
     return {
-        "target": target,
-        "rc": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr
+        "stdout": "".join(full_output),
+        "returncode": process.returncode
     }
 
-# ---------------------------------------------------------------------------
-# Local Entrypoint — Coordinating the flow
-# ---------------------------------------------------------------------------
+
 @app.local_entrypoint()
-def main(target: str = "all"):
+def main(target: str = "bench_moe_smoke"):
     """
-    Main entry point for Modal runs.
-    """
-    targets = target.split(",")
-    print(f"\n{'='*60}")
-    print(f"  LLM System Kernels — Modal Cloud Runner")
-    print(f"{'='*60}")
+    Local entrypoint to run benchmarks or profiling on cloud GPUs.
+
+    Usage:
+        modal run modal_run.py --target bench_moe_smoke
+        modal run modal_run.py --target profile_moe_1
     
+    Results are logged to results.jsonl (one JSON object per line).
+    """
+    print("\n===========================================================")
+    print("=                                                         =")
+    print("=  LLM System Kernels — Modal Cloud Runner                =")
+    print("=                                                         =")
+    print("===========================================================")
+
+    targets = target.split(",")
     failed = []
+
     for t in targets:
         t = t.strip()
         res = run_make_target.remote(t)
-        
-        # Print the remote stdout to local console
-        if res["stdout"]:
-            print(res["stdout"])
-        if res["stderr"]:
-            print(res["stderr"], file=sys.stderr)
-            
-        if res["rc"] != 0:
+
+        if res["returncode"] == 0:
+            print(f"   ✅ Target '{t}' PASSED.")
+        else:
+            print(f"   ❌ Target '{t}' FAILED (exit code {res['returncode']}).")
             failed.append(t)
-        
-        # If we ran benchmarks, populate results.text locally
-        # Update local results.text if relevant
-        if t in ["bench", "bench_moe", "bench_dsa", "all", "profile_moe", "profile_moe_diag"]:
-            print(f"\n📝 Populating results.text locally...")
-            with open("results.text", "a") as f:
-                f.write(f"\n--- Result for 'make {t}' on Blackwell B200 ---\n")
-                f.write(res["stdout"])
-            print(f"   ✓ results.text updated.")
-            
-    print("\n" + "="*60)
+
+        # Log every run as structured JSON
+        log_result(t, res)
+        print(f"   📝 Logged to {RESULTS_FILE}")
+
     if failed:
+        print(f"\n==============================================")
         print(f"❌ FAILED targets: {failed}")
         sys.exit(1)
     else:
-        print("✅ All targets completed successfully! 🎉")
+        print(f"\n==============================================")
+        print(f"✅ All targets completed successfully! 🎉")

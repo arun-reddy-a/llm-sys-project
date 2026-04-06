@@ -557,7 +557,7 @@ __global__ void group_reorder_kernel(const float* input,
     int tk = blockIdx.x * blockDim.x + threadIdx.x;
     if (tk >= T * K) return;
     int e = expert_indices[tk];
-    if (e < -1) return;
+    if (e < 0) return; // Fix: guard against -1 expert indices
     int t = tk / K;
     int dest = expert_offsets[e] + token_idx_in_expert[tk];
     grouped_token_map[dest] = t;
@@ -570,19 +570,16 @@ __global__ void grouped_gemm_bt_kernel(const float* __restrict__ A,
                                        float* __restrict__ C,
                                        const int* __restrict__ expert_offsets,
                                        int D, int N, int E) {
-    // Current block's row in the TOTAL concatenated output buffer
     int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    if (col >= N) return;
 
-    // Find which expert this row belongs to
+    // Expert lookup
+    int total_rows = expert_offsets[E];
     int e = 0;
-    while (e < E - 1 && row >= expert_offsets[e+1]) e++;
-    int total_rows = expert_offsets[E]; // Total tokens across all experts
-    if (row >= total_rows) return;
+    if (row < total_rows) {
+        while (e < E - 1 && row >= expert_offsets[e+1]) e++;
+    }
 
-    // Expert's portion of W
-    // If W_ptr contains E concatenated W matrices, each [N, D]
     const float* W_e = W_ptr + (size_t)e * N * D;
 
     __shared__ float As[TILE_SIZE][TILE_SIZE];
@@ -593,19 +590,24 @@ __global__ void grouped_gemm_bt_kernel(const float* __restrict__ A,
 
     for (int t = 0; t < numTiles; t++) {
         int a_col = t * TILE_SIZE + threadIdx.x;
-        As[threadIdx.y][threadIdx.x] = (a_col < D) ? A[row * D + a_col] : 0.0f;
+        As[threadIdx.y][threadIdx.x] = (row < total_rows && a_col < D) ? A[row * D + a_col] : 0.0f;
 
         // Load W_e transposed (coalesced B read)
         int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
         int b_col = t * TILE_SIZE + threadIdx.x;
-        Bs[threadIdx.x][threadIdx.y] = (b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
+        Bs[threadIdx.x][threadIdx.y] = (col < N && b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
 
         __syncthreads();
+
         #pragma unroll
-        for (int i = 0; i < TILE_SIZE; i++) sum += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        for (int i = 0; i < TILE_SIZE; i++) {
+            sum += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
         __syncthreads();
     }
-    C[row * N + col] = sum;
+    if (row < total_rows && col < N) {
+        C[row * N + col] = sum;
+    }
 }
 
 __global__ void grouped_scatter_kernel(const float* grouped_out,
@@ -865,12 +867,12 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
                                                    int D, int N, int E) {
     int row = blockIdx.y * TILE_SIZE + threadIdx.y;
     int col = blockIdx.x * TILE_SIZE + threadIdx.x;
-    if (col >= N) return;
 
-    int e = 0;
-    while (e < E - 1 && row >= expert_offsets[e+1]) e++;
     int total_rows = expert_offsets[E];
-    if (row >= total_rows) return;
+    int e = 0;
+    if (row < total_rows) {
+        while (e < E - 1 && row >= expert_offsets[e+1]) e++;
+    }
 
     const float* W_e = W_ptr + (size_t)e * N * D;
 
@@ -885,7 +887,7 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
     {
         int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
         int b_col = 0 * TILE_SIZE + threadIdx.x;
-        float val = (b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
+        float val = (col < N && b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
         Bs[0][threadIdx.x][threadIdx.y] = val; // Store in buffer 0
         __syncthreads();
     }
@@ -899,24 +901,24 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
         if (next_t < numTiles) {
             int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
             int b_col = next_t * TILE_SIZE + threadIdx.x;
-            float val = (b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
-            // This remains a software-managed staging path. A true TMA path
-            // would replace these scalar loads with tensor-map async copies.
+            float val = (col < N && b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
             Bs[next_buf][threadIdx.x][threadIdx.y] = val;
         }
 
         // Compute Tile t from curr_buf
         int a_col = t * TILE_SIZE + threadIdx.x;
-        As[threadIdx.y][threadIdx.x] = (a_col < D) ? A[row * D + a_col] : 0.0f;
+        As[threadIdx.y][threadIdx.x] = (row < total_rows && a_col < D) ? A[row * D + a_col] : 0.0f;
         
         __syncthreads();
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; i++) {
             sum += As[threadIdx.y][i] * Bs[curr_buf][i][threadIdx.x];
         }
-        __syncthreads(); // Wait for computation to finish before we potentially overwrite curr_buf in next iteration
+        __syncthreads(); 
     }
-    C[row * N + col] = sum;
+    if (row < total_rows && col < N) {
+        C[row * N + col] = sum;
+    }
 }
 
 // 6. OPT 5: Double-buffered grouped GEMM implementation

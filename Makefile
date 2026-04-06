@@ -3,6 +3,7 @@ NVCC_FLAGS  = -std=c++17 -O2 -arch=native
 DEBUG_FLAGS = -std=c++17 -G -g -arch=native
 
 BUILD_DIR  = build
+VARIANT   ?= Opt5
 
 # Source files
 MOE_SRC = kernels/moe/naive_moe.cu
@@ -10,8 +11,9 @@ MOE_SRC = kernels/moe/naive_moe.cu
 # Targets
 TEST_MOE  = $(BUILD_DIR)/test_moe
 BENCH_MOE = $(BUILD_DIR)/bench_moe
+SIMPLE_VADD = $(BUILD_DIR)/simple_vadd
 
-.PHONY: all tests benchmarks test bench clean debug_tests
+.PHONY: all tests benchmarks test bench clean debug_tests profile_vadd_nsys profile_vadd_ncu check_tools
 
 all: tests benchmarks
 
@@ -29,6 +31,9 @@ $(TEST_MOE): tests/test_moe.cu $(MOE_SRC) | $(BUILD_DIR)
 
 $(BENCH_MOE): benchmarks/bench_moe.cu $(MOE_SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/bench_moe.cu $(MOE_SRC)
+
+bench_moe_smoke: $(MOE_SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -lnvToolsExt -o build/bench_moe_smoke benchmarks/bench_moe_smoke.cu $(MOE_SRC)
 
 # Debug builds (with device-side debugging)
 debug_tests: | $(BUILD_DIR)
@@ -54,19 +59,68 @@ test_moe: $(TEST_MOE)
 bench_moe: $(BENCH_MOE)
 	./$(BENCH_MOE)
 
-# ---------- Profiling targets (MoE) ----------
+check_tools:
+	@nsys --version
+	@ncu --version
+	@nsys profile --help | grep "cuda-hw" || echo "cuda-hw NOT in help"
 
-profile_moe: $(BENCH_MOE)
-	./profiling/profile_moe.sh --stage all
+simple_vadd: $(SIMPLE_VADD)
+	./$(SIMPLE_VADD)
 
-profile_moe_nsys: $(BENCH_MOE)
-	./profiling/profile_moe.sh --stage 1
+$(SIMPLE_VADD): benchmarks/simple_vadd.cu | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/simple_vadd.cu
 
-profile_moe_ncu: $(BENCH_MOE)
-	./profiling/profile_moe.sh --stage 2
+# --- Simple Vector Add Profiling ---
 
-profile_moe_diag:
-	./profiling/profile_moe.sh --stage 3
+profile_vadd_nsys: $(SIMPLE_VADD)
+	mkdir -p profiling/results
+	nsys profile \
+		--output=profiling/results/simple_vadd_nsys \
+		--force-overwrite=true \
+		--trace=cuda,nvtx,osrt \
+		--sample=none \
+		--stats=true \
+		./$(SIMPLE_VADD)
+
+profile_vadd_nsys_hw: $(SIMPLE_VADD)
+	mkdir -p profiling/results
+	nsys profile \
+		--output=profiling/results/simple_vadd_nsys_hw \
+		--force-overwrite=true \
+		--trace=cuda-hw,nvtx,osrt \
+		--sample=none \
+		--stats=true \
+		./$(SIMPLE_VADD)
+
+profile_vadd_ncu: $(SIMPLE_VADD)
+	mkdir -p profiling/results
+	ncu --set full \
+		--target-processes all \
+		--export profiling/results/simple_vadd_ncu \
+		--force-overwrite \
+		./$(SIMPLE_VADD)
+	@echo "\n📊 Exporting CSV for analysis..."
+	ncu --import profiling/results/simple_vadd_ncu.ncu-rep --csv --page raw > profiling/results/simple_vadd_ncu.csv
+	@python3 profiling/analyze_ncu.py profiling/results/simple_vadd_ncu.csv
+
+# ---------- MoE Profiling (3-stage pipeline) ----------
+# Uses bench_moe_smoke (NVTX-instrumented) as the profiling workload.
+# See docs/moe/PROFILING.md for the full decision tree.
+
+# Stage 1: Timeline Trace (Nsight Systems — find the slow kernel)
+profile_moe_1: bench_moe_smoke
+	./profiling/profile_moe.sh --stage 1 --variant $(VARIANT) --bench-bin ./build/bench_moe_smoke
+
+# Stage 2: Deep Dive (Nsight Compute — roofline, memory, compute, occupancy)
+profile_moe_2: bench_moe_smoke
+	./profiling/profile_moe.sh --stage 2 --variant $(VARIANT) --bench-bin ./build/bench_moe_smoke
+
+# Stage 3: Automated Diagnosis (parse NCU metrics into recommendations)
+profile_moe_3:
+	./profiling/profile_moe.sh --stage 3 --variant $(VARIANT)
+
+# All 3 stages in sequence
+profile_moe_full: profile_moe_1 profile_moe_2 profile_moe_3
 
 clean:
 	rm -rf $(BUILD_DIR)

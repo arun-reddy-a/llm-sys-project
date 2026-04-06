@@ -164,12 +164,32 @@ def parse_csv(path: str) -> list[KernelProfile]:
                 profiles.append(profile)
 
             # Map metric to field
-            field_name = METRIC_MAP.get(metric_name)
+            # Blackwell metrics may have prefixes like "SM_A.TriageCompute."
+            # We search for the base metric name in the record.
+            field_name = None
+            for base_name, f_name in METRIC_MAP.items():
+                if base_name in metric_name:
+                    field_name = f_name
+                    break
+
             if field_name:
                 try:
-                    val = float(metric_value.replace(",", ""))
-                    # For averaging, we just take the last value seen
-                    # (ncu CSV may have multiple launches; we keep the latest)
+                    # Strip whitespace and unit if present
+                    val_str = metric_value.strip().replace(",", "")
+                    if not val_str or val_str.lower() in ["no data", "n/a"]:
+                        continue
+                    
+                    val = float(val_str)
+                    
+                    # Unit handling: convert ms to ns if needed for duration
+                    metric_unit = record.get("Metric Unit", "").strip().lower()
+                    if field_name == "duration_ns" and metric_unit == "ms":
+                        val *= 1e6
+                    elif field_name == "duration_ns" and metric_unit == "us":
+                        val *= 1e3
+                    
+                    # For metrics collected across multiple launches, we take the max
+                    # or average. Here we just take the latest for simplicity.
                     setattr(profile, field_name, val)
                 except (ValueError, TypeError):
                     pass
@@ -443,11 +463,11 @@ def print_diagnosis(profiles: list[KernelProfile]):
     print(f"  {'Kernel':<45s} {'Time(ms)':>8s} {'Class':<25s} {'Occupancy':>9s}")
     print(f"  {'─'*45} {'─'*8} {'─'*25} {'─'*9}")
     for p in profiles_sorted:
-        if p.duration_ns <= 0 and p.sm_throughput_pct <= 0:
-            continue
+        # Clean kernel name for display
+        short_name = p.name.split("<")[0].split("(")[0]
         dur_ms = p.duration_ns / 1e6 if p.duration_ns > 0 else 0
         cls = classify_bottleneck(p)
-        print(f"  {p.name:<45s} {dur_ms:8.3f} {cls:<25s} {p.achieved_occupancy:8.1f}%")
+        print(f"  {short_name[:45]:<45s} {dur_ms:8.3f} {cls:<25s} {p.achieved_occupancy:8.1f}%")
 
     # ── Top recommendation ──────────────────────────────────────────────────
     if profiles_sorted:

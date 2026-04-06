@@ -1,64 +1,62 @@
-# MoE Kernel Profiling Guide — Full Decision Tree
+# MoE Kernel Profiling Guide
 
 ## Overview
 
-This profiling pipeline implements the **measure → identify → fix → re-measure** workflow for your MoE CUDA kernels on the Blackwell B200.
+This profiling pipeline implements the **measure → identify → fix → re-measure** loop for MoE CUDA kernels on the Blackwell B200. It uses NVIDIA Nsight Systems for timeline analysis and Nsight Compute for deep kernel metrics.
 
-## Files Created
+> [!IMPORTANT]
+> **Don't optimize blindly.** Always measure first, identify the binding constraint, fix that one thing, then measure again. The bottleneck often shifts after each fix.
+
+## Profiling Infrastructure
 
 | File | Purpose |
 |---|---|
-| [profile_moe.sh](file:///home/rrongali/llm-sys-project/profiling/profile_moe.sh) | Main orchestrator (3 stages) |
-| [diagnose_moe.py](file:///home/rrongali/llm-sys-project/profiling/diagnose_moe.py) | Automated decision-tree analyzer |
-| [Makefile](file:///home/rrongali/llm-sys-project/Makefile) | New `profile_moe*` targets |
+| `profiling/profile_moe.sh` | Main profiling orchestrator (3 stages) |
+| `profiling/diagnose_moe.py` | Automated decision-tree bottleneck analyzer |
+| `profiling/analyze_ncu.py` | Lightweight NCU CSV parser (for simple kernels) |
+| `benchmarks/bench_moe_smoke.cu` | NVTX-instrumented smoke benchmark for profiling |
+
+## Quick Start
+
+```bash
+# On B200 via Modal:
+modal run modal_run.py --target profile_moe_1    # Stage 1: Timeline
+modal run modal_run.py --target profile_moe_2    # Stage 2: Deep metrics
+modal run modal_run.py --target profile_moe_3    # Stage 3: Diagnosis
+modal run modal_run.py --target profile_moe_full # All 3 stages
+```
+
+Or invoke the script directly:
+
+```bash
+./profiling/profile_moe.sh --variant Opt5 --stage 1
+./profiling/profile_moe.sh --variant Opt3 --stage 2
+./profiling/profile_moe.sh --stage 3
+```
 
 ## The Decision Tree
 
 ```mermaid
 graph TD
-    A["Profile with Nsight Systems<br/>(Stage 1)"] --> B["Find slow kernel"]
-    B --> C["Profile with Nsight Compute<br/>(Stage 2)"]
-    C --> D{"Check Roofline"}
+    A["Stage 1: Nsight Systems"] --> B["Find slow kernel"]
+    B --> C["Stage 2: Nsight Compute"]
+    C --> D{"Roofline Classification"}
     D -->|"DRAM throughput > 60%"| E["MEMORY BOUND"]
     D -->|"SM throughput > 60%"| F["COMPUTE BOUND"]
     D -->|"Both < 40%"| G["LATENCY BOUND"]
     
-    E --> E1["Check coalescing<br/>sectors/request ratio"]
-    E --> E2["Check bank conflicts<br/>shared memory"]
-    E --> E3["Check L1/L2 hit rates"]
-    E --> E4["Check achieved bandwidth<br/>vs peak"]
+    E --> E1["Coalescing ratio"]
+    E --> E2["Bank conflicts"]
+    E --> E3["L1/L2 hit rates"]
+    E --> E4["Achieved bandwidth vs peak"]
     
-    F --> F1["Check Tensor Core util"]
-    F --> F2["Check instruction mix<br/>FADD/FMUL/FFMA"]
-    F --> F3["Check achieved GFLOP/s<br/>vs peak"]
+    F --> F1["Tensor Core utilization"]
+    F --> F2["Instruction mix (FADD/FMUL/FFMA)"]
+    F --> F3["Achieved GFLOP/s vs peak"]
     
-    G --> G1["Check occupancy<br/>regs, smem, block size"]
-    G --> G2["Check warp stall reasons<br/>7 stall categories"]
-    G --> G3["Check ILP<br/>issue rate"]
-```
-
-## Quick Start
-
-### On the B200 (via Modal or direct SSH)
-
-```bash
-# Full pipeline: nsys → ncu → diagnosis
-make profile_moe
-
-# Individual stages
-make profile_moe_nsys    # Stage 1: Timeline — find slow kernel
-make profile_moe_ncu     # Stage 2: Deep metrics on all kernels  
-make profile_moe_diag    # Stage 3: Parse results into diagnosis
-```
-
-### Direct script usage
-
-```bash
-# Profile only Opt3 variant
-./profiling/profile_moe.sh --variant Opt3 --stage 2
-
-# Just run diagnosis on existing data
-./profiling/profile_moe.sh --stage 3
+    G --> G1["Occupancy (regs, smem, block size)"]
+    G --> G2["Warp stall breakdown (7 categories)"]
+    G --> G3["Issue rate / ILP"]
 ```
 
 ## Stage Details
@@ -67,102 +65,68 @@ make profile_moe_diag    # Stage 3: Parse results into diagnosis
 
 **Goal**: Find which kernel dominates wall-clock time.
 
-**What it does**:
-- Runs `nsys profile` on the benchmark binary
-- Generates `.nsys-rep` file (open in Nsight Systems GUI)
-- Prints kernel-by-kernel GPU time summary
-- Prints CUDA API call summary (shows host-side overhead)
+Runs `nsys profile` on the smoke benchmark. Generates a `.nsys-rep` file and prints kernel-by-kernel GPU time and CUDA API summaries.
+
+**Trace modes**:
+- `--trace=cuda,nvtx,osrt` — Standard software-instrumented trace. Works everywhere.
+- `--trace=cuda-hw,nvtx,osrt` — Blackwell hardware trace. Lower overhead, ±10ns precision. **Use one or the other, never combine `cuda` and `cuda-hw`.**
 
 **What to look for**:
-- Which kernel name appears with the highest total GPU time
-- Large gaps between kernels (= CPU-side overhead / synchronization)
-- `cudaMemcpy` calls (= unnecessary host-device transfers in the loop)
+- Which kernel has the highest total GPU time
+- Gaps between kernels (CPU-side overhead / synchronization)
+- `cudaMemcpy` calls inside the benchmark loop (unnecessary transfers)
 
 ### Stage 2: Nsight Compute (Deep Dive)
 
 **Goal**: Classify each kernel and find the root cause.
 
-**Metrics collected** (40+ metrics in 4 groups):
+Collects ~30 metrics organized into 4 groups:
 
-````carousel
-### Group A: Roofline Classification
-| Metric | What it tells you |
-|---|---|
-| `sm__throughput` | Overall SM utilization (%) |
-| `gpu__dram_throughput` | DRAM bandwidth utilization (%) |
-| `gpu__compute_memory_throughput` | Combined throughput |
+| Group | Key Metrics | Classification Rule |
+|---|---|---|
+| **Roofline** | `sm__throughput`, `gpu__dram_throughput` | DRAM > 60% → memory-bound; SM > 60% → compute-bound |
+| **Memory** | Coalescing ratio, bank conflicts, L1/L2 hit rates, achieved BW | Diagnoses *why* memory is slow |
+| **Compute** | Tensor Core %, instruction mix, achieved GFLOP/s | Diagnoses *why* compute is slow |
+| **Latency** | Occupancy, 7 warp stall categories, issue rate | Diagnoses *why* the GPU is underutilized |
 
-**Rule**: If DRAM > 60% → memory-bound. If SM > 60% → compute-bound. Both low → latency-bound.
-<!-- slide -->
-### Group B: Memory-Bound Deep Dive
-| Metric | What it tells you |
-|---|---|
-| `l1tex__t_sectors / requests` | Coalescing efficiency |
-| `l1tex__data_bank_conflicts_*` | Shared memory bank conflicts |
-| `l1tex__t_sector_hit_rate` | L1 cache hit rate |
-| `lts__t_sector_hit_rate` | L2 cache hit rate |
-| `dram__bytes_read/write` | Achieved bandwidth |
-
-**Key ratio**: sectors/request should be ≤ 4 for coalesced access.
-<!-- slide -->
-### Group C: Compute-Bound Deep Dive
-| Metric | What it tells you |
-|---|---|
-| `sm__pipe_tensor_cycles_active` | Tensor Core utilization |
-| `sm__sass_thread_inst_executed_op_ffma` | FMA instruction count |
-| `FLOP/duration` | Achieved GFLOP/s |
-
-**Key check**: If tensor_core_pct < 5%, you're leaving massive performance on the table.
-<!-- slide -->
-### Group D: Latency-Bound Deep Dive
-| Metric | What it tells you |
-|---|---|
-| `achieved_occupancy` | Active warps vs max |
-| `launch__registers_per_thread` | Register pressure |
-| `launch__shared_mem_per_block_*` | Shared memory pressure |
-| `smsp__warps_issue_stalled_*` | 7 stall categories |
-| `smsp__issue_active` | ILP / issue rate |
-
-**Stall categories**:
-- **Long Scoreboard**: Waiting for global memory → needs prefetching
-- **Short Scoreboard**: Waiting for L1/smem → bank conflicts or latency
-- **Wait**: `__syncthreads()` barriers → reduce sync points
-- **Math Pipe Throttle**: Compute pipe full → already compute-saturated
-- **MIO Throttle**: Memory pipe full → use vectorized loads
-````
+Uses `--launch-skip 50 --launch-count 20` to skip warmup kernel launches and profile only steady-state iterations.
 
 ### Stage 3: Automated Diagnosis
 
-**Goal**: Walk the decision tree automatically and output a human-readable report.
+**Goal**: Parse NCU metrics through the decision tree and output a human-readable report.
 
-The Python script (`diagnose_moe.py`) parses the ncu CSV export and for each kernel:
-1. **Classifies** it via roofline thresholds
-2. **Drills down** into the appropriate analysis branch
-3. **Identifies** the dominant bottleneck
-4. **Recommends** specific fixes
-
-> [!TIP]
-> Output includes a visual warp stall breakdown with bar charts, making it easy to spot the dominant stall at a glance.
+`diagnose_moe.py` reads the NCU CSV export and for each kernel:
+1. Classifies it via roofline thresholds
+2. Drills down into the appropriate analysis branch
+3. Identifies the dominant bottleneck (e.g., "Long Scoreboard stall at 35%")
+4. Recommends specific fixes
 
 ## Metrics Cheatsheet
 
-| Concept | Nsight Compute Metric | Threshold |
+| Concept | Metric | Bad Threshold |
 |---|---|---|
-| Coalescing | `l1tex__t_sectors / requests` | > 4 = bad |
-| Bank conflicts | `l1tex__data_bank_conflicts_*` | > 1000 = high |
-| L1 hit rate | `l1tex__t_sector_hit_rate` | < 50% = low |
-| L2 hit rate | `lts__t_sector_hit_rate` | < 50% = low |
-| Occupancy | `achieved_occupancy` | < 50% = low |
-| Tensor cores | `sm__pipe_tensor_cycles_active` | < 5% = unused |
-| ILP | `smsp__issue_active / active_cycles` | < 30% = low |
-| DRAM BW | `dram__bytes / duration` | vs peak (8 TB/s on B200) |
+| Coalescing | `l1tex__t_sectors / requests` | > 4 sectors/request |
+| Bank conflicts | `l1tex__data_bank_conflicts_*` | > 1000 total |
+| L1 hit rate | `l1tex__t_sector_hit_rate` | < 50% |
+| L2 hit rate | `lts__t_sector_hit_rate` | < 50% |
+| Occupancy | `sm__warps_active` | < 50% |
+| Tensor cores | `sm__pipe_tensor_cycles_active` | < 5% (unused) |
+| Issue rate | `smsp__issue_active` | < 30% |
+| DRAM bandwidth | `dram__bytes / duration` | vs 8 TB/s peak (B200) |
 
-## The Golden Rule
+## NVTX Instrumentation
 
-> [!IMPORTANT]
-> **Don't optimize blindly.** The workflow is always:
-> 1. **Measure** → identify binding constraint
-> 2. **Fix that one thing**
-> 3. **Measure again** — the bottleneck often shifts after each fix
->
-> Fixing a non-binding constraint does nothing. Roofline tells you which roof you're hitting. Stall analysis tells you why.
+The smoke benchmark (`bench_moe_smoke.cu`) is instrumented with NVTX ranges:
+- `warmup` — wraps all warmup iterations
+- `bench_<Variant>` — wraps the timed benchmark loop for each variant
+- `<Variant>_iter_<N>` — wraps each individual iteration
+
+This enables:
+- Filtering warmup out of Nsight Systems timelines
+- Targeted NCU profiling of specific iterations (via `--launch-skip`/`--launch-count`)
+
+## External Resources
+
+- **Nsight Systems User Guide (local)**: `docs/external/nsight_systems_user_guide.html`
+- **Nsight Systems Docs**: https://docs.nvidia.com/nsight-systems/UserGuide/index.html
+- **Nsight Compute Docs**: https://docs.nvidia.com/nsight-compute/NsightCompute/index.html

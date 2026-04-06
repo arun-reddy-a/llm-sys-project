@@ -29,7 +29,6 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${PROJECT_ROOT}/profiling/results"
 BUILD_DIR="${PROJECT_ROOT}/build"
 BENCH_BIN="${BUILD_DIR}/bench_moe"
-PROFILE_BIN="${BUILD_DIR}/profile_moe"
 
 # ─── Parse args ─────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -37,6 +36,7 @@ while [[ $# -gt 0 ]]; do
         --variant)  VARIANT="$2"; shift 2 ;;
         --stage)    STAGE="$2";   shift 2 ;;
         --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+        --bench-bin) BENCH_BIN="$2"; shift 2 ;;
         -h|--help)
             head -25 "$0" | tail -20
             exit 0
@@ -62,11 +62,15 @@ echo ""
 # We build a special target that runs a SINGLE variant with enough iterations
 # for profiling (no need to compare all 6 variants for profiling)
 build_profile_binary() {
+    if [[ -f "${BENCH_BIN}" ]]; then
+        echo "▸ Benchmark binary already exists: ${BENCH_BIN}"
+        return 0
+    fi
     echo "▸ Building profile binary..."
     mkdir -p "${BUILD_DIR}"
 
-    # Build the regular benchmark binary (we'll use it with ncu --kernel-name filters)
-    nvcc -std=c++17 -O2 -arch=native -lineinfo \
+    # Build the regular benchmark binary
+    nvcc -std=c++17 -O2 -arch=native -lineinfo -lnvToolsExt \
         -o "${BENCH_BIN}" \
         "${PROJECT_ROOT}/benchmarks/bench_moe.cu" \
         "${PROJECT_ROOT}/kernels/moe/naive_moe.cu"
@@ -88,15 +92,25 @@ run_nsys() {
     echo ""
 
     local NSYS_OUT="${PREFIX}_nsys"
+    local BENCH_ARGS=""
+    # bench_moe_smoke doesn't accept CLI args (hardcoded warmup/iters).
+    # bench_moe accepts: <warmup> <iters>
+    if [[ ! "${BENCH_BIN}" == *"smoke"* ]]; then
+        BENCH_ARGS="2 3"
+    fi
 
+    # Use hardware-based tracing on Blackwell (B200)
+    # NOTE: cuda-hw REPLACES cuda — they cannot be combined.
     nsys profile \
         --output="${NSYS_OUT}" \
         --force-overwrite=true \
         --trace=cuda,nvtx,osrt \
         --sample=none \
         --cudabacktrace=all \
-        --stats=true \
-        "${BENCH_BIN}" 5 20
+        "${BENCH_BIN}" "${VARIANT}"
+
+    # Wait for nsys to finalize the report file
+    sleep 5
 
     echo ""
     echo "  ▸ Timeline report saved: ${NSYS_OUT}.nsys-rep"
@@ -223,9 +237,10 @@ run_ncu() {
     local METRICS_CSV
     METRICS_CSV=$(IFS=,; echo "${ALL_METRICS[*]}")
 
-    # ── Define kernel name filters for each MoE kernel ──────────────────────
-    # We want to profile the GEMM kernels (the bottleneck) but also gather
-    # data on routing, scatter, SwiGLU for completeness.
+    # ── Reference: MoE kernel names for manual filtering ─────────────────
+    # These are NOT passed to ncu (we profile all kernels).
+    # Use with --kernel-name if you want to target a specific kernel:
+    #   ncu --kernel-name "grouped_gemm_bt_kernel" ...
     local KERNEL_FILTERS=(
         # Grouped GEMM variants (the main compute kernels)
         "grouped_gemm_bt_kernel"
@@ -259,17 +274,19 @@ run_ncu() {
     echo "  This may take several minutes per kernel invocation."
     echo ""
 
-    # Run ncu — profile ALL kernels, limited iterations for speed
-    # --launch-skip: skip warmup iterations, --launch-count: profile N launches
+    # Run ncu — profile kernels, skip warmup launches
+    # --launch-skip: skip warmup kernel launches
+    # --launch-count: profile only a few launches for each kernel
+    # We skip the first ~50 launches (warmup) and profile the next 20.
     ncu --set full \
         --metrics "${METRICS_CSV}" \
-        --launch-skip 10 \
-        --launch-count 50 \
+        --launch-skip 2 \
+        --launch-count 20 \
         --target-processes all \
         --export "${NCU_OUT}" \
         --force-overwrite \
         --page raw \
-        "${BENCH_BIN}" 10 20 \
+        "${BENCH_BIN}" "${VARIANT}" \
         2>&1 | tee "${NCU_OUT}_console.log"
 
     echo ""
