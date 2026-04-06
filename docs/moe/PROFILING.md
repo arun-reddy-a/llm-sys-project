@@ -138,6 +138,7 @@ This enables:
 
 ## External Resources
 
-- **Nsight Systems User Guide (local)**: `docs/external/nsight_systems_user_guide.html`
-- **Nsight Systems Docs**: https://docs.nvidia.com/nsight-systems/UserGuide/index.html
-- **Nsight Compute Docs**: https://docs.nvidia.com/nsight-compute/NsightCompute/index.html
+- **Nsight Systems User Guide Index**: [nsight_systems_index.md](../external/nsight_systems_index.md) (Use this to find specific CLI flags or CUDA trace options)
+- **Nsight Systems User Guide (HTML)**: `docs/external/nsight_systems_user_guide.html`
+- **Nsight Systems Docs (Web)**: https://docs.nvidia.com/nsight-systems/UserGuide/index.html
+- **Nsight Compute Docs (Web)**: https://docs.nvidia.com/nsight-compute/NsightCompute/index.html
