@@ -80,5 +80,33 @@ bench_moe: $(BENCH_MOE)
 bench_dsa: $(BENCH_DSA)
 	./$(BENCH_DSA)
 
+# ---------- Profiling targets (MoE) ----------
+
+profile_moe: $(BENCH_MOE)
+	./profiling/profile_moe.sh --stage all
+
+profile_moe_nsys: $(BENCH_MOE)
+	./profiling/profile_moe.sh --stage 1
+
+profile_moe_ncu: $(BENCH_MOE)
+	./profiling/profile_moe.sh --stage 2
+
+profile_moe_diag:
+	./profiling/profile_moe.sh --stage 3
+
+# ---------- Profiling targets (DSA) ----------
+
+profile_dsa: $(BENCH_DSA)
+	./profiling/profile_dsa.sh --stage all
+
+profile_dsa_nsys: $(BENCH_DSA)
+	./profiling/profile_dsa.sh --stage 1
+
+profile_dsa_ncu: $(BENCH_DSA)
+	./profiling/profile_dsa.sh --stage 2
+
+profile_dsa_diag:
+	./profiling/profile_dsa.sh --stage 3
+
 clean:
 	rm -rf $(BUILD_DIR)
