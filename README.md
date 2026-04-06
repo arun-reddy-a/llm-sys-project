@@ -13,18 +13,19 @@ Custom CUDA kernels for Mixture-of-Experts (MoE) layers, targeting NVIDIA Blackw
 
 You can build and run this project on cloud GPUs using [Modal](https://modal.com). This is the recommended way to benchmark on the latest **Blackwell B200** GPUs.
 
+### Standard DeepSeek-V3 Workflow
+
+To benchmark, verify, and profile the production-standard variant:
+
 ```bash
-# 1. Install and setup Modal
-pip install modal
-modal setup
+# 1. Benchmark Throughput (Peak: 88k Tok/s)
+modal run modal_run.py --target bench_moe
 
-# 2. Run smoke benchmark on a Blackwell B200
-modal run modal_run.py --target bench_moe_smoke
+# 2. Verify Correctness (Sigmoid-Bias-Grouped Routing)
+modal run modal_run.py --target test_deepseek
 
-# 3. Profile MoE kernels (3-stage pipeline)
-modal run modal_run.py --target profile_moe_1    # Timeline trace
-modal run modal_run.py --target profile_moe_2    # Deep kernel metrics
-modal run modal_run.py --target profile_moe_3    # Automated diagnosis
+# 3. Full Profiling Analysis (NSYS -> NCU -> Diagnosis)
+modal run modal_run.py --target profile_moe_full --variant DeepSeek
 ```
 
 See [docs/modal/README.md](docs/modal/README.md) for more details.
@@ -79,7 +80,8 @@ Executing `modal run modal_run.py --target profile_moe_full` orchestrated our cu
 │       ├── naive_moe.cuh           # MoE config struct + kernel declarations
 │       └── naive_moe.cu            # MoE kernel implementations (Naive → Opt5)
 ├── tests/
-│   └── test_moe.cu                 # MoE correctness tests (GPU vs CPU reference)
+│   ├── test_moe.cu                 # MoE correctness tests
+│   └── test_moe_deepseek.cu        # DeepSeek-V3 correctness tests
 ├── benchmarks/
 │   ├── bench_moe.cu                # MoE full benchmark (all variants × configs)
 │   ├── bench_moe_smoke.cu          # MoE smoke benchmark (NVTX-instrumented, for profiling)
@@ -122,14 +124,11 @@ The MoE forward pass executes five stages, each as a separate kernel (intentiona
 
 Tests compare GPU kernel output against a CPU reference implementation for multiple problem sizes:
 
-```
-=== MoE Correctness Tests ===
-
-  small  (T=4, E=4, D=64)          max_err=X.XXe-XX  mean_err=X.XXe-XX  PASS
-  medium (T=32, E=8, D=128)        max_err=X.XXe-XX  mean_err=X.XXe-XX  PASS
-  ...
-
-Results: N / N passed
+```bash
+# Run all tests
+make test
+# Run only DeepSeek-V3 production tests
+modal run modal_run.py --target test_deepseek
 ```
 
 The error tolerance is 1e-3 for smaller sizes and 1e-2 for larger sizes (FP32 accumulation differences).

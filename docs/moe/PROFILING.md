@@ -20,10 +20,22 @@ This profiling pipeline implements the **measure → identify → fix → re-mea
 
 ```bash
 # On B200 via Modal:
-modal run modal_run.py --target profile_moe_1    # Stage 1: Timeline
-modal run modal_run.py --target profile_moe_2    # Stage 2: Deep metrics
-modal run modal_run.py --target profile_moe_full # Runs 1 & 2, fetches files, runs diagnosis
+modal run modal_run.py --target profile_moe_1 --variant DeepSeek
+modal run modal_run.py --target profile_moe_2 --variant DeepSeek
+modal run modal_run.py --target profile_moe_full --variant DeepSeek
 ```
+
+### DeepSeek-V3 Profiling Configuration
+The `DeepSeek` variant in the smoke benchmark profiles the following:
+- **T=512** tokens (Standard profiling scale)
+- **E=256** experts (Full DeepSeek-V3 scale)
+- **K=8** experts-per-token
+- **N_GROUP=8, TOPK_GROUP=4** (Production routing)
+
+When profiling, look for the following kernel names in the diagnosis:
+1. `fused_gate_deepseek_kernel` (Routing lookup)
+2. `group_reorder_kernel` (Token data movement)
+3. `grouped_gemm_blackwell_async_kernel` (Main W1/W2 compute)
 
 ### The Auto-Fetch Pipeline
 When you execute profiling via `modal_run.py`, the system generates a unique **`RUN_ID`**. 
