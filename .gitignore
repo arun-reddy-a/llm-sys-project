@@ -6,3 +6,4 @@ profiling/local_results/
 *.sqlite
 *.csv
 results.jsonl
+third_party/*

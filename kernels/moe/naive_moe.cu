@@ -886,60 +886,65 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
 
     int tile_m_within_e = tile_m_global - m_tile_offsets[e];
     
-    int global_row_base = expert_offsets[e] + tile_m_within_e * TILE_SIZE;
-    int global_col_base = tile_n * TILE_SIZE;
+    int global_row_base = expert_offsets[e] + tile_m_within_e * 64;
+    int global_col_base = tile_n * 64;
     
     int expert_total_rows = expert_offsets[e+1] - expert_offsets[e];
-    int row_within_e_base = tile_m_within_e * TILE_SIZE;
+    int row_within_e_base = tile_m_within_e * 64;
 
     const float* W_e = W_ptr + (size_t)e * N * D;
 
     // Double buffers for weights (Bs) and activations (As)
-    // Bs padded by 4 floats (16 bytes) to maintain float4 alignment while shifting SMEM banks
-    __shared__ float As[2][TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 4];
-    __shared__ float Cs[TILE_SIZE][TILE_SIZE];
+    // 64x32 patches padded by 4 floats to maintain 16-byte alignment and offset memory banks
+    // Overlay Cs onto As and Bs to avoid exceeding the 48KB default static SMEM structural limit!
+    __shared__ union {
+        struct {
+            float As[2][64][36];
+            float Bs[2][64][36];
+        };
+        float Cs[64][64];
+    } smem;
 
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float> c_frag;
-    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+    // Each warp processes a 16x32 block of the 64x64 C Tile (requires 2 fragments of 16x16)
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 8, float> c_frag[2];
+    nvcuda::wmma::fill_fragment(c_frag[0], 0.0f);
+    nvcuda::wmma::fill_fragment(c_frag[1], 0.0f);
 
-    int numTiles = (D + TILE_SIZE - 1) / TILE_SIZE;
-    int tid = threadIdx.y * TILE_SIZE + threadIdx.x;
+    int numTiles = (D + 32 - 1) / 32;
+    int tid = threadIdx.y * blockDim.x + threadIdx.x; // Block is still passed as 16x16 = 256 threads
     int warp_id = tid / 32;
+    int warp_row = warp_id / 2; // 0..3 (spans 64 rows structurally)
+    int warp_col = warp_id % 2; // 0..1 (spans 64 cols structurally)
 
     // --- PROLOGUE: Async Prefetch Tile 0 ---
     {
-        if (tid < 64) {
-            int row_in_tile = tid / 4;
-            int col_in_tile = (tid % 4) * 4;
-            int a_col = 0 * TILE_SIZE + col_in_tile;
-            
-            bool valid_A = (row_within_e_base + row_in_tile < expert_total_rows && a_col < D);
-            if (valid_A) {
-                __pipeline_memcpy_async(&As[0][row_in_tile][col_in_tile], &A[(global_row_base + row_in_tile) * D + a_col], sizeof(float4));
-            } else {
-                As[0][row_in_tile][col_in_tile + 0] = 0.0f;
-                As[0][row_in_tile][col_in_tile + 1] = 0.0f;
-                As[0][row_in_tile][col_in_tile + 2] = 0.0f;
-                As[0][row_in_tile][col_in_tile + 3] = 0.0f;
-            }
-        } else if (tid < 128) {
-            int t_tid = tid - 64;
-            int row_in_tile = t_tid / 4;
-            int col_in_tile = (t_tid % 4) * 4;
-            int b_row = global_col_base + row_in_tile;
-            int b_col = 0 * TILE_SIZE + col_in_tile;
+        // Total fetch for A: 64*32 = 2048 floats. Threads: 256. Each fetches 8 floats = 2 float4s.
+        int a_idx1 = tid * 2;
+        int a_idx2 = tid * 2 + 1;
+        
+        int a_r1 = a_idx1 / 8; // 8 float4s per 32-wide row
+        int a_c1 = (a_idx1 % 8) * 4;
+        bool valid_A1 = (row_within_e_base + a_r1 < expert_total_rows && (0 * 32 + a_c1) < D);
+        if (valid_A1) __pipeline_memcpy_async(&smem.As[0][a_r1][a_c1], &A[(global_row_base + a_r1) * D + (0 * 32 + a_c1)], sizeof(float4));
+        else { smem.As[0][a_r1][a_c1] = 0.0f; smem.As[0][a_r1][a_c1+1] = 0.0f; smem.As[0][a_r1][a_c1+2] = 0.0f; smem.As[0][a_r1][a_c1+3] = 0.0f; }
 
-            bool valid_B = (b_row < N && b_col < D); // W_e is [N, D]
-            if (valid_B) {
-                __pipeline_memcpy_async(&Bs[0][row_in_tile][col_in_tile], &W_e[b_row * D + b_col], sizeof(float4));
-            } else {
-                Bs[0][row_in_tile][col_in_tile + 0] = 0.0f;
-                Bs[0][row_in_tile][col_in_tile + 1] = 0.0f;
-                Bs[0][row_in_tile][col_in_tile + 2] = 0.0f;
-                Bs[0][row_in_tile][col_in_tile + 3] = 0.0f;
-            }
-        }
+        int a_r2 = a_idx2 / 8;
+        int a_c2 = (a_idx2 % 8) * 4;
+        bool valid_A2 = (row_within_e_base + a_r2 < expert_total_rows && (0 * 32 + a_c2) < D);
+        if (valid_A2) __pipeline_memcpy_async(&smem.As[0][a_r2][a_c2], &A[(global_row_base + a_r2) * D + (0 * 32 + a_c2)], sizeof(float4));
+        else { smem.As[0][a_r2][a_c2] = 0.0f; smem.As[0][a_r2][a_c2+1] = 0.0f; smem.As[0][a_r2][a_c2+2] = 0.0f; smem.As[0][a_r2][a_c2+3] = 0.0f; }
+
+        // Fetch B (transposed conceptually but contiguous in memory)
+        int b_r1 = a_r1; int b_c1 = a_c1;
+        bool valid_B1 = ((global_col_base + b_r1) < N && (0 * 32 + b_c1) < D);
+        if (valid_B1) __pipeline_memcpy_async(&smem.Bs[0][b_r1][b_c1], &W_e[(global_col_base + b_r1) * D + (0 * 32 + b_c1)], sizeof(float4));
+        else { smem.Bs[0][b_r1][b_c1] = 0.0f; smem.Bs[0][b_r1][b_c1+1] = 0.0f; smem.Bs[0][b_r1][b_c1+2] = 0.0f; smem.Bs[0][b_r1][b_c1+3] = 0.0f; }
+
+        int b_r2 = a_r2; int b_c2 = a_c2;
+        bool valid_B2 = ((global_col_base + b_r2) < N && (0 * 32 + b_c2) < D);
+        if (valid_B2) __pipeline_memcpy_async(&smem.Bs[0][b_r2][b_c2], &W_e[(global_col_base + b_r2) * D + (0 * 32 + b_c2)], sizeof(float4));
+        else { smem.Bs[0][b_r2][b_c2] = 0.0f; smem.Bs[0][b_r2][b_c2+1] = 0.0f; smem.Bs[0][b_r2][b_c2+2] = 0.0f; smem.Bs[0][b_r2][b_c2+3] = 0.0f; }
+
         __pipeline_commit();
     }
 
@@ -951,37 +956,31 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
 
         // Initiate async fetch for Tile N+1
         if (next_t < numTiles) {
-            if (tid < 64) {
-                int row_in_tile = tid / 4;
-                int col_in_tile = (tid % 4) * 4;
-                int a_col = next_t * TILE_SIZE + col_in_tile;
-                
-                bool valid_A = (row_within_e_base + row_in_tile < expert_total_rows && a_col < D);
-                if (valid_A) {
-                    __pipeline_memcpy_async(&As[next_buf][row_in_tile][col_in_tile], &A[(global_row_base + row_in_tile) * D + a_col], sizeof(float4));
-                } else {
-                    As[next_buf][row_in_tile][col_in_tile + 0] = 0.0f;
-                    As[next_buf][row_in_tile][col_in_tile + 1] = 0.0f;
-                    As[next_buf][row_in_tile][col_in_tile + 2] = 0.0f;
-                    As[next_buf][row_in_tile][col_in_tile + 3] = 0.0f;
-                }
-            } else if (tid < 128) {
-                int t_tid = tid - 64;
-                int row_in_tile = t_tid / 4;
-                int col_in_tile = (t_tid % 4) * 4;
-                int b_row = global_col_base + row_in_tile;
-                int b_col = next_t * TILE_SIZE + col_in_tile;
+            int a_idx1 = tid * 2;
+            int a_idx2 = tid * 2 + 1;
+            
+            int a_r1 = a_idx1 / 8;
+            int a_c1 = (a_idx1 % 8) * 4;
+            bool valid_A1 = (row_within_e_base + a_r1 < expert_total_rows && (next_t * 32 + a_c1) < D);
+            if (valid_A1) __pipeline_memcpy_async(&smem.As[next_buf][a_r1][a_c1], &A[(global_row_base + a_r1) * D + (next_t * 32 + a_c1)], sizeof(float4));
+            else { smem.As[next_buf][a_r1][a_c1] = 0.0f; smem.As[next_buf][a_r1][a_c1+1] = 0.0f; smem.As[next_buf][a_r1][a_c1+2] = 0.0f; smem.As[next_buf][a_r1][a_c1+3] = 0.0f; }
 
-                bool valid_B = (b_row < N && b_col < D);
-                if (valid_B) {
-                    __pipeline_memcpy_async(&Bs[next_buf][row_in_tile][col_in_tile], &W_e[b_row * D + b_col], sizeof(float4));
-                } else {
-                    Bs[next_buf][row_in_tile][col_in_tile + 0] = 0.0f;
-                    Bs[next_buf][row_in_tile][col_in_tile + 1] = 0.0f;
-                    Bs[next_buf][row_in_tile][col_in_tile + 2] = 0.0f;
-                    Bs[next_buf][row_in_tile][col_in_tile + 3] = 0.0f;
-                }
-            }
+            int a_r2 = a_idx2 / 8;
+            int a_c2 = (a_idx2 % 8) * 4;
+            bool valid_A2 = (row_within_e_base + a_r2 < expert_total_rows && (next_t * 32 + a_c2) < D);
+            if (valid_A2) __pipeline_memcpy_async(&smem.As[next_buf][a_r2][a_c2], &A[(global_row_base + a_r2) * D + (next_t * 32 + a_c2)], sizeof(float4));
+            else { smem.As[next_buf][a_r2][a_c2] = 0.0f; smem.As[next_buf][a_r2][a_c2+1] = 0.0f; smem.As[next_buf][a_r2][a_c2+2] = 0.0f; smem.As[next_buf][a_r2][a_c2+3] = 0.0f; }
+
+            int b_r1 = a_r1; int b_c1 = a_c1;
+            bool valid_B1 = ((global_col_base + b_r1) < N && (next_t * 32 + b_c1) < D);
+            if (valid_B1) __pipeline_memcpy_async(&smem.Bs[next_buf][b_r1][b_c1], &W_e[(global_col_base + b_r1) * D + (next_t * 32 + b_c1)], sizeof(float4));
+            else { smem.Bs[next_buf][b_r1][b_c1] = 0.0f; smem.Bs[next_buf][b_r1][b_c1+1] = 0.0f; smem.Bs[next_buf][b_r1][b_c1+2] = 0.0f; smem.Bs[next_buf][b_r1][b_c1+3] = 0.0f; }
+
+            int b_r2 = a_r2; int b_c2 = a_c2;
+            bool valid_B2 = ((global_col_base + b_r2) < N && (next_t * 32 + b_c2) < D);
+            if (valid_B2) __pipeline_memcpy_async(&smem.Bs[next_buf][b_r2][b_c2], &W_e[(global_col_base + b_r2) * D + (next_t * 32 + b_c2)], sizeof(float4));
+            else { smem.Bs[next_buf][b_r2][b_c2] = 0.0f; smem.Bs[next_buf][b_r2][b_c2+1] = 0.0f; smem.Bs[next_buf][b_r2][b_c2+2] = 0.0f; smem.Bs[next_buf][b_r2][b_c2+3] = 0.0f; }
+
             __pipeline_commit();
         }
 
@@ -989,37 +988,38 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
         __pipeline_wait_prior(0);
         __syncthreads();
 
-        // TF32 Tensor Core Math (Assigned to Warp 0)
-        if (warp_id == 0) {
-            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_frag1;
-            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_frag2;
-
+        // TF32 Tensor Core Math across all 8 Warps handling the 64x64 output block
+        for (int k_idx = 0; k_idx < 32; k_idx += 8) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::row_major> a_frag;
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::col_major> b_frag1;
             nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 8, nvcuda::wmma::precision::tf32, nvcuda::wmma::col_major> b_frag2;
 
-            nvcuda::wmma::load_matrix_sync(a_frag1, &As[curr_buf][0][0], TILE_SIZE);
-            nvcuda::wmma::load_matrix_sync(a_frag2, &As[curr_buf][0][8], TILE_SIZE);
-            
-            nvcuda::wmma::load_matrix_sync(b_frag1, &Bs[curr_buf][0][0], TILE_SIZE + 4);
-            nvcuda::wmma::load_matrix_sync(b_frag2, &Bs[curr_buf][0][8], TILE_SIZE + 4);
+            nvcuda::wmma::load_matrix_sync(a_frag, &smem.As[curr_buf][warp_row * 16][k_idx], 36);
+            nvcuda::wmma::load_matrix_sync(b_frag1, &smem.Bs[curr_buf][warp_col * 32 + 0][k_idx], 36);
+            nvcuda::wmma::load_matrix_sync(b_frag2, &smem.Bs[curr_buf][warp_col * 32 + 16][k_idx], 36);
 
-            nvcuda::wmma::mma_sync(c_frag, a_frag1, b_frag1, c_frag);
-            nvcuda::wmma::mma_sync(c_frag, a_frag2, b_frag2, c_frag);
+            nvcuda::wmma::mma_sync(c_frag[0], a_frag, b_frag1, c_frag[0]);
+            nvcuda::wmma::mma_sync(c_frag[1], a_frag, b_frag2, c_frag[1]);
         }
         __syncthreads(); 
     }
     
-    // Distribute results safely from Warp 0 across the entire block
-    if (warp_id == 0) {
-        nvcuda::wmma::store_matrix_sync(&Cs[0][0], c_frag, TILE_SIZE, nvcuda::wmma::mem_row_major);
-    }
+    // Distribute results safely from all warps to SMEM buffer
+    nvcuda::wmma::store_matrix_sync(&smem.Cs[warp_row * 16][warp_col * 32 + 0], c_frag[0], 64, nvcuda::wmma::mem_row_major);
+    nvcuda::wmma::store_matrix_sync(&smem.Cs[warp_row * 16][warp_col * 32 + 16], c_frag[1], 64, nvcuda::wmma::mem_row_major);
     __syncthreads();
     
-    float sum = Cs[threadIdx.y][threadIdx.x];
-
-    // --- EPILOGUE: Write Result ---
-    if (row_within_e_base + threadIdx.y < expert_total_rows && global_col_base + threadIdx.x < N) {
-        C[(global_row_base + threadIdx.y) * N + (global_col_base + threadIdx.x)] = sum;
+    // Unloaded safely 4 elements per thread to global memory (each thread covers 1/256th of the 4096 elements)
+    // 4096 / 256 = 16 elements. Which means 4 float4s perfectly mapped for aligned global memory pushes!
+    // Since we need to write to C, we can just write back normally!
+    int linear_idx = tid;
+    for (int i = 0; i < 16; i++) {
+        int idx = linear_idx * 16 + i;
+        int crow = idx / 64;
+        int ccol = idx % 64;
+        if (row_within_e_base + crow < expert_total_rows && global_col_base + ccol < N) {
+            C[(global_row_base + crow) * N + (global_col_base + ccol)] = smem.Cs[crow][ccol];
+        }
     }
 }
 
@@ -1057,7 +1057,7 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
     // Calculate m_tile_offsets for accurate grouped GEMM bounds checking
     std::vector<int> h_m_tile_offsets(E_local + 1, 0);
     for (int i = 0; i < E_local; i++) {
-        int tiles = (h_counts[i] + TILE_SIZE - 1) / TILE_SIZE;
+        int tiles = (h_counts[i] + 64 - 1) / 64;
         h_m_tile_offsets[i+1] = h_m_tile_offsets[i] + tiles;
     }
     DeviceBuf<int> m_tile_offsets(E_local + 1);
@@ -1076,9 +1076,9 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
 
     // Double-buffered + cp.async Grouped GEMM 1
     {
-        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 block(256);
         int total_m_tiles = h_m_tile_offsets[E_local];
-        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, total_m_tiles);
+        dim3 grid((2 * I + 64 - 1) / 64, total_m_tiles);
         if (total_m_tiles > 0) {
             grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
                 grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
@@ -1090,9 +1090,9 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
 
     // Double-buffered + cp.async Grouped GEMM 2
     {
-        dim3 block(TILE_SIZE, TILE_SIZE);
+        dim3 block(256);
         int total_m_tiles = h_m_tile_offsets[E_local];
-        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, total_m_tiles);
+        dim3 grid((D + 64 - 1) / 64, total_m_tiles);
         if (total_m_tiles > 0) {
             grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
                 g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
