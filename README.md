@@ -9,30 +9,6 @@ Custom CUDA kernels for Mixture-of-Experts (MoE) layers, targeting NVIDIA Blackw
 - **GNU Make**
 - **C++17**-capable host compiler (GCC >= 9, Clang >= 10)
 
-## Quick Start
-
-```bash
-# Clone the repo
-git clone <repo-url> && cd LLM-Sys-Project
-
-# Build everything (tests + benchmarks)
-# By default, -arch=native is used, which auto-detects your GPU at compile time.
-make all
-
-# Run correctness tests
-make test
-
-# Run benchmarks
-make bench
-
-# Run individually
-make test_moe
-make bench_moe
-
-# Clean build artifacts
-make clean
-```
-
 ## ☁️ Modal Cloud Execution
 
 You can build and run this project on cloud GPUs using [Modal](https://modal.com). This is the recommended way to benchmark on the latest **Blackwell B200** GPUs.
