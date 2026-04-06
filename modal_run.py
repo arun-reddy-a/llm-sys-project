@@ -15,7 +15,10 @@ app = modal.App("llm-sys-kernels")
 # - Includes developmental tools for kernels.
 image = (
     modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.11")
-    .apt_install("git", "build-essential")
+    .apt_install("git", "build-essential", "wget", "gnupg")
+    .run_commands(
+        "apt-get update && apt-get install -y nsight-systems-cli nsight-compute",
+    )
     # Add local project files into /workspace
     .add_local_dir(
         ".",
@@ -87,7 +90,8 @@ def main(target: str = "all"):
             failed.append(t)
         
         # If we ran benchmarks, populate results.text locally
-        if t in ["bench", "bench_moe", "bench_dsa", "all"]:
+        # Update local results.text if relevant
+        if t in ["bench", "bench_moe", "bench_dsa", "all", "profile_moe", "profile_moe_diag"]:
             print(f"\n📝 Populating results.text locally...")
             with open("results.text", "a") as f:
                 f.write(f"\n--- Result for 'make {t}' on Blackwell B200 ---\n")
