@@ -864,60 +864,107 @@ __global__ void grouped_gemm_blackwell_async_kernel(const float* __restrict__ A,
                                                    const float* __restrict__ W_ptr,
                                                    float* __restrict__ C,
                                                    const int* __restrict__ expert_offsets,
+                                                   const int* __restrict__ m_tile_offsets,
                                                    int D, int N, int E) {
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    // Hardware dispatch mapping
+    int tile_m_global = blockIdx.y;
+    int tile_n = blockIdx.x;
 
-    int total_rows = expert_offsets[E];
+    // Binary search to find which expert this block belongs to
+    int e_low = 0, e_high = E - 1;
     int e = 0;
-    if (row < total_rows) {
-        while (e < E - 1 && row >= expert_offsets[e+1]) e++;
+    while (e_low <= e_high) {
+        int mid = e_low + (e_high - e_low) / 2;
+        if (tile_m_global >= m_tile_offsets[mid]) {
+            e = mid;
+            e_low = mid + 1;
+        } else {
+            e_high = mid - 1;
+        }
     }
+
+    int tile_m_within_e = tile_m_global - m_tile_offsets[e];
+    
+    int global_row = expert_offsets[e] + tile_m_within_e * TILE_SIZE + threadIdx.y;
+    int global_col = tile_n * TILE_SIZE + threadIdx.x;
+    
+    int expert_total_rows = expert_offsets[e+1] - expert_offsets[e];
+    int row_within_e = tile_m_within_e * TILE_SIZE + threadIdx.y;
 
     const float* W_e = W_ptr + (size_t)e * N * D;
 
-    // Double buffers for weights (B)
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 1];
+    // Double buffers for weights (Bs) and activations (As)
+    __shared__ float As[2][TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[2][TILE_SIZE][TILE_SIZE + 1]; // +1 to avoid bank conflicts
 
     float sum = 0.0f;
     int numTiles = (D + TILE_SIZE - 1) / TILE_SIZE;
 
-    // Initial Prefetch (Tile 0)
+    // --- PROLOGUE: Async Prefetch Tile 0 ---
     {
-        int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
-        int b_col = 0 * TILE_SIZE + threadIdx.x;
-        float val = (col < N && b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
-        Bs[0][threadIdx.x][threadIdx.y] = val; // Store in buffer 0
-        __syncthreads();
-    }
-
-    for (int t = 0; t < numTiles; t++) {
-        int next_t = t + 1;
-        int curr_buf = t % 2;
-        int next_buf = (t + 1) % 2;
-
-        // Async Prefetch Tile next_t into next_buf
-        if (next_t < numTiles) {
-            int b_row = (col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
-            int b_col = next_t * TILE_SIZE + threadIdx.x;
-            float val = (col < N && b_row < N && b_col < D) ? W_e[b_row * D + b_col] : 0.0f;
-            Bs[next_buf][threadIdx.x][threadIdx.y] = val;
+        int a_col = 0 * TILE_SIZE + threadIdx.x;
+        bool valid_A = (row_within_e < expert_total_rows && a_col < D);
+        if (valid_A) {
+            __pipeline_memcpy_async(&As[0][threadIdx.y][threadIdx.x], &A[global_row * D + a_col], sizeof(float));
+        } else {
+            As[0][threadIdx.y][threadIdx.x] = 0.0f;
         }
 
-        // Compute Tile t from curr_buf
-        int a_col = t * TILE_SIZE + threadIdx.x;
-        As[threadIdx.y][threadIdx.x] = (row < total_rows && a_col < D) ? A[row * D + a_col] : 0.0f;
-        
+        int b_row = (global_col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
+        int b_col = 0 * TILE_SIZE + threadIdx.x;
+        bool valid_B = (global_col < N && b_row < N && b_col < D);
+        if (valid_B) {
+            __pipeline_memcpy_async(&Bs[0][threadIdx.x][threadIdx.y], &W_e[b_row * D + b_col], sizeof(float));
+        } else {
+            Bs[0][threadIdx.x][threadIdx.y] = 0.0f;
+        }
+
+        __pipeline_commit();
+    }
+
+    // --- MAIN PIPELINE LOOP ---
+    for (int t = 0; t < numTiles; t++) {
+        int curr_buf = t % 2;
+        int next_buf = (t + 1) % 2;
+        int next_t = t + 1;
+
+        // Initiate async fetch for Tile N+1
+        if (next_t < numTiles) {
+            int a_col = next_t * TILE_SIZE + threadIdx.x;
+            bool valid_A = (row_within_e < expert_total_rows && a_col < D);
+            if (valid_A) {
+                __pipeline_memcpy_async(&As[next_buf][threadIdx.y][threadIdx.x], &A[global_row * D + a_col], sizeof(float));
+            } else {
+                As[next_buf][threadIdx.y][threadIdx.x] = 0.0f;
+            }
+
+            int b_row = (global_col / TILE_SIZE) * TILE_SIZE + threadIdx.y;
+            int b_col = next_t * TILE_SIZE + threadIdx.x;
+            bool valid_B = (global_col < N && b_row < N && b_col < D);
+            if (valid_B) {
+                // Transposed load for B
+                __pipeline_memcpy_async(&Bs[next_buf][threadIdx.x][threadIdx.y], &W_e[b_row * D + b_col], sizeof(float));
+            } else {
+                Bs[next_buf][threadIdx.x][threadIdx.y] = 0.0f;
+            }
+            __pipeline_commit();
+        }
+
+        // Wait for Tile N to finish loading from GMEM -> SMEM
+        __pipeline_wait_prior(0);
         __syncthreads();
+
+        // Compute Tile N from SMEM registers
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; i++) {
-            sum += As[threadIdx.y][i] * Bs[curr_buf][i][threadIdx.x];
+            sum += As[curr_buf][threadIdx.y][i] * Bs[curr_buf][i][threadIdx.x];
         }
         __syncthreads(); 
     }
-    if (row < total_rows && col < N) {
-        C[row * N + col] = sum;
+    
+    // --- EPILOGUE: Write Result ---
+    if (row_within_e < expert_total_rows && global_col < N) {
+        C[global_row * N + global_col] = sum;
     }
 }
 
@@ -949,9 +996,17 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
     DeviceBuf<int> expert_offsets(E + 1);
     expert_offsets.upload(h_offsets.data());
 
-    // Only process tokens assigned to local experts [0..E_local)
     int total_local = h_offsets[E_local];
     if (total_local == 0) return;
+
+    // Calculate m_tile_offsets for accurate grouped GEMM bounds checking
+    std::vector<int> h_m_tile_offsets(E_local + 1, 0);
+    for (int i = 0; i < E_local; i++) {
+        int tiles = (h_counts[i] + TILE_SIZE - 1) / TILE_SIZE;
+        h_m_tile_offsets[i+1] = h_m_tile_offsets[i] + tiles;
+    }
+    DeviceBuf<int> m_tile_offsets(E_local + 1);
+    CUDA_CHECK(cudaMemcpyAsync(m_tile_offsets.ptr, h_m_tile_offsets.data(), (E_local + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
 
     int total_active = h_offsets[E];
     DeviceBuf<float> grouped_input(total_active * D);
@@ -964,22 +1019,30 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
     CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
     DeviceBuf<float> g_gemm1_out(total_local * 2 * I), g_act_out(total_local * I), g_gemm2_out(total_local * D);
 
-    // Double-buffered Grouped GEMM 1 (local experts only)
+    // Double-buffered + cp.async Grouped GEMM 1
     {
         dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, (total_local + TILE_SIZE - 1) / TILE_SIZE);
-        grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-            grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, D, 2 * I, E_local);
+        int total_m_tiles = h_m_tile_offsets[E_local];
+        dim3 grid((2 * I + TILE_SIZE - 1) / TILE_SIZE, total_m_tiles);
+        if (total_m_tiles > 0) {
+            grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
+                grouped_input.ptr, d_w1, g_gemm1_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
+                D, 2 * I, E_local);
+        }
     }
 
     swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(g_gemm1_out.ptr, g_act_out.ptr, total_local, I);
 
-    // Double-buffered Grouped GEMM 2 (local experts only)
+    // Double-buffered + cp.async Grouped GEMM 2
     {
         dim3 block(TILE_SIZE, TILE_SIZE);
-        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, (total_local + TILE_SIZE - 1) / TILE_SIZE);
-        grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-            g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, I, D, E_local);
+        int total_m_tiles = h_m_tile_offsets[E_local];
+        dim3 grid((D + TILE_SIZE - 1) / TILE_SIZE, total_m_tiles);
+        if (total_m_tiles > 0) {
+            grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
+                g_act_out.ptr, d_w2, g_gemm2_out.ptr, expert_offsets.ptr, m_tile_offsets.ptr,
+                I, D, E_local);
+        }
     }
 
     grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(

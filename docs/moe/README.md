@@ -1,155 +1,82 @@
 # MoE Kernel Optimizations
 
-This document summarizes the implemented Mixture-of-Experts forward optimizations in this repo and describes what each version actually changes in the current CUDA code. The focus here is accuracy to the implementation in [`kernels/moe/naive_moe.cu`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu), not an idealized future design.
+This document chronicles the architectural journey, bottlenecks, and the final highly optimized implementations for the Mixture-of-Experts (MoE) forward pass. The current implementations are consolidated in [`kernels/moe/naive_moe.cu`](../../kernels/moe/naive_moe.cu).
 
-## Baseline
+Rather than just listing the optimized states, this README documents *why* we took the path we did, specifically dissecting the performance constraints of the NVIDIA Blackwell (B200) architecture.
 
-The baseline MoE path materializes nearly every intermediate in global memory and iterates over experts on the host:
+## Baseline 
 
-1. `gate_logits_kernel`, `softmax_experts_kernel`, and `topk_kernel` run as separate launches.
-2. `gather_kernel` scans all tokens for one expert at a time using a single thread.
-3. GEMM1, SwiGLU, GEMM2, and scatter are launched once per expert.
-4. The host copies each expert's token count back from device memory and synchronizes before deciding whether to launch that expert's FFN path.
+The baseline naive MoE implementation writes all intermediates to global memory, using separate kernel launches for each mathematical phase:
+1. `gate_logits_kernel` computes logits.
+2. `softmax_experts_kernel` handles probability generation.
+3. `topk_kernel` does the expert selection.
+4. `gather_kernel` reads non-contiguous memory, pulling tokens needed for one expert into a contiguous buffer.
+5. FFN operations (GEMM1, SwiGLU, GEMM2) are dispatched repeatedly per expert via the host.
 
-That structure is intentionally simple, but it creates three major bottlenecks:
+### The Problem
+This architecture suffers from catastrophic launch overhead (launching $E$ individual small GEMMs sequentially on the host), serial blocking (the loop synchronizes the CPU with the GPU constantly), and brutal DRAM bandwidth consumption (streaming full `[T, E]` and intermediate activation arrays to and from HBM).
 
-- routing writes and rereads the full `[T, E]` logit tensor from DRAM
-- token movement is serialized by a per-expert gather loop
-- the FFN path pays repeated host launch and synchronization overhead
+---
 
 ## Optimization 2: Fused Routing
 
-Optimization 2 replaces the three-stage routing pipeline with a single kernel, [`fused_gate_kernel`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L85). The launch uses one block per token, and shared memory is partitioned into two regions:
+Optimization 2 addresses the front-end of the MoE block by fusing the routing calculation into a single `fused_gate_kernel`.
 
-- `s_input[D]` caches the token embedding once for the whole block
-- `s_logits[E]` stores the gate logits produced for that token
+1. A block cooperatively stages the token inputs into Shared Memory.
+2. The threads compute exactly one expert logit each.
+3. Thread 0 (or a designated warp) performs a block-level Softmax and Top-K accumulation *entirely inside registers/shared memory*. 
+4. The final selection `expert_indices` and `expert_weights` are written to DRAM.
 
-The main effect is that the token vector is loaded from global memory a single time per token rather than once per expert. Relative to the baseline gate-logit kernel, that removes the repeated input reads that previously scaled with `E`.
+### The Win
+The full `[T, E]` logit matrix no longer escapes into DRAM. A sequence of 3 un-optimized launches is condensed into one launch, drastically alleviating L2 cache thrashing on the token routing paths.
 
-Inside the kernel:
-
-1. Threads cooperatively load `input[t, :]` into shared memory.
-2. Threads with `threadIdx.x < E` compute one expert logit each and write into `s_logits`.
-3. Thread 0 performs softmax over experts directly from shared memory.
-4. The same thread performs top-K selection and renormalizes the selected routing weights.
-
-This removes two extra kernel launches and avoids materializing the full logit tensor in DRAM. The outputs that still reach global memory are only the final `expert_indices[T, K]` and `expert_weights[T, K]`.
-
-### Consistency notes
-
-The high-level description is mostly consistent with the code, with two caveats:
-
-- softmax and top-K are currently done by a single thread for simplicity, so the kernel is more launch-efficient than throughput-optimal
-- the current launch caps the thread count at 256, so this implementation is best matched to the small-to-moderate expert counts used by the benchmark configs in [`benchmarks/bench_moe.cu`](/home/rrongali/llm-sys-project/benchmarks/bench_moe.cu)
+---
 
 ## Optimization 3: Grouped GEMM
 
-Optimization 3 removes the per-expert FFN launch loop and converts the expert work into a grouped execution flow. The implementation is in [`moe_forward_opt3`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L635).
+Optimization 3 fixes the devastating per-expert FFN host-launch overhead by utilizing a **Grouped GEMM** paradigm (`moe_forward_opt3`).
 
-The grouped path has four phases before the FFN math:
+1. **Histogram & Atomic Work:** `expert_grouping_kernel` builds an atomic histogram identifying exactly how many tokens require execution on each expert.
+2. **Reordering:** `group_reorder_kernel` permutes all tokens into a contiguous chunk in DRAM.
+3. **The Grouped GEMM:** Instead of looping on the CPU, we launch a single massive GEMM grid calculation for all tokens across all active experts. The kernel uses pre-computed bounds (`expert_offsets`) to ensure that each thread block correctly maps its rows to the correct subset of the massive, combined Multi-Layer Perceptron weights.
 
-1. Fused routing produces `expert_indices` and `expert_weights`.
-2. [`expert_grouping_kernel`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L543) uses `atomicAdd` to build a histogram of token assignments per expert and records each token's local position within that expert bucket.
-3. A prefix sum over expert counts computes `expert_offsets`, which define the contiguous segment belonging to each expert in the grouped buffers.
-4. [`group_reorder_kernel`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L553) permutes token rows into a single grouped input matrix and records the original token id for later scatter.
+### The Win
+This completely excises the repetitive host launching! The entire forward pass runs as a constant $O(1)$ sequence of massive hardware grids, rather than $O(E)$ microscopic grids. 
 
-Once tokens are packed contiguously by expert, each FFN stage becomes a single grouped launch:
-
-- one grouped GEMM for `W1`
-- one SwiGLU launch over the packed rows
-- one grouped GEMM for `W2`
-- one grouped scatter back into `[T, D]`
-
-The grouped GEMM kernel, [`grouped_gemm_bt_kernel`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L569), determines which expert a given output row belongs to by comparing the row index against `expert_offsets`. It then selects the corresponding expert weight matrix from the concatenated `W1` or `W2` tensor and computes that row's output.
-
-This is a substantial improvement over the baseline because the number of GPU launches no longer scales with `E`. For a fixed forward pass, the kernel sequence is constant-size even if the number of experts grows.
-
-### Consistency notes
-
-Most of the provided description matches the code, but two details should be stated more carefully:
-
-- the histogram and token reordering are device-side and parallel, but the prefix sum is still performed on the CPU after copying counts back, so one host-device synchronization remains
-- the implementation eliminates the per-expert host loop, not all host coordination
-
-So a precise wording is: Optimization 3 eliminates the repeated per-expert host synchronizations and reduces the forward pass to a fixed set of launches, but it still contains one CPU-side prefix-sum step in the current version.
+---
 
 ## Optimization 4: Fully Fused Expert Kernel
 
-Optimization 4, implemented by [`fused_moe_kernel`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L716), moves the entire token forward path into a single kernel. One block is assigned to one token, and shared memory holds the token-local working set:
+Optimization 4 is a monolithic architectural experiment. Instead of grouping all tokens and executing massive GEMMs, `fused_moe_kernel` allocates exactly **one block per token**.
+Every single block computes the routing logits internally, retrieves its designated Top-K experts, loads exactly the matrices it requires, calculates the mathematical dot-products (GEMV) using local shared memory for the `SwiGLU` projection, and aggregates its final sum to DRAM.
 
-- input vector `s_x[D]`
-- routing logits `s_logits[E]`
-- intermediate activation storage `s_act[2 * I]`
-- output accumulator `s_y[D]`
+### The Verdict
+While highly elegant, eliminating intermediate global memory completely, **it severely limits hardware math execution (arithmetic intensity)**. Matrix-Vector multiplications (GEMV) drastically underutilize Tensor Cores compared to unified Grouped computations. Furthermore, massive shared-memory footprint demands limit block occupancy, capping performance scalability on standard models.
 
-Within a block, the kernel performs:
+---
 
-1. cooperative load of the token input
-2. routing logits, softmax, and top-K selection
-3. per-selected-expert GEMV for `W1`
-4. in-kernel SwiGLU
-5. per-selected-expert GEMV for `W2`
-6. weighted accumulation into the token output
+## Optimization 5: Async DMA Pipelines (`cp.async`) 
 
-The main benefit is that routing, expert activation, and accumulation are all kept on-chip for the lifetime of the token. This avoids allocating large intermediate global-memory buffers such as grouped token matrices or GEMM outputs.
+Optimization 5 details the critical findings while targeting optimal Blackwell B200 execution, addressing the latency barriers that Grouped GEMMs exhibit on large expert counts.
 
-The tradeoff is compute efficiency. Unlike Optimization 3, which converts expert work into larger GEMMs, this fused kernel performs token-centric GEMVs. That reduces arithmetic intensity and gives the hardware less opportunity to amortize weight loads across multiple tokens. Shared-memory usage also grows with `D + E + 2I + D`, which limits scalability to larger hidden sizes and intermediate sizes.
+### The Persistent Thread Trap
+Initially, we assumed that even with Grouped GEMMs, assigning blocks across massive expert grids was incurring CTA hardware scheduling overheads. We designed a **Persistent Thread Pattern**: allocating a fixed grid of 640 CTAs locking into an atomic work queue. 
 
-This makes Optimization 4 a good conceptual "fully fused" design point, but not necessarily the fastest implementation for moderate or large batches.
+**Result: 2.5x Performance Degradation.**
 
-## Optimization 5: Double-Buffered Grouped GEMM
+By tracking metrics through Nsight Compute, we uncovered that CTA launch overhead at the 35ms timescale was a ghost (costing roughly 0.02% of the runtime). More importantly: sweeping 32GB of $W_1$ and $W_2$ weights via random persistent assignments broke the hardware L2 Cache localities, hammering the Memory Controller. The bottleneck on Blackwell isn't the dispatch—it's the DRAM bandwidth. 
 
-Optimization 5 keeps the grouped execution structure of Optimization 3 and swaps in a pipelined grouped GEMM kernel, [`grouped_gemm_blackwell_async_kernel`](/home/rrongali/llm-sys-project/kernels/moe/naive_moe.cu#L839), for both `W1` and `W2`.
+### The Solution: Direct Global-to-Shared DMA
+Optimization 5 (`grouped_gemm_blackwell_async_kernel`) drops the Persistent Thread model and leverages true hardware asynchronous copies (`cuda::pipeline` / `cp.async`).
+1. We preserve the highly performant standard hardware grid scheduling, ensuring adjacent blocks maintain proper spatial L2 cache residency.
+2. We invoke `__pipeline_memcpy_async` instructions.
+3. The hardware initiates a **Direct Memory Access (DMA)** request pulling weights out of Global Memory straight into Shared Memory memory-banks, completely bypassing the SM execution datapath and the Register File.
 
-The kernel allocates:
+### The Alignment Trap (Why it's currently 57ms)
+While async DMA guarantees we avoid the register file, our current execution resulted in a **57.3ms latency** (slower than the 35ms baseline). Because we instructed `__pipeline_memcpy_async` to fetch exactly `sizeof(float)`, we effectively forced the DMA hardware to execute isolated 4-byte loads (`cp.async.ca.shared.global.b32`). 
+Our previous naive `val = A[...]` loop was automatically vectorized by the `nvcc` compiler into 128-bit fetches (`LDG.E 128`). By dropping to rigid scalar async pipelines, we shattered the memory coalescence, generating 4x the required memory transactions. 
 
-- one shared-memory tile buffer for activations, `As`
-- two shared-memory tile buffers for weights, `Bs[2]`
-
-The intended schedule is:
-
-1. preload tile 0 of the expert weight matrix into buffer 0
-2. while computing tile `t` from buffer `t % 2`, stage tile `t + 1` into the alternate buffer
-3. alternate buffers across iterations so the next tile is ready when the loop advances
-
-This is the standard software structure for double buffering, and it is the right control flow if we later replace the manual shared-memory fills with true asynchronous copies.
-
-### Consistency notes
-
-The current implementation is not yet a real asynchronous Blackwell TMA pipeline:
-
-- it uses ordinary shared-memory writes, not `cp.async`, TMA, or hardware-managed async transactions
-- synchronization is still done with block-wide `__syncthreads()`
-- the overlap is therefore structural rather than fully asynchronous
-
-So the strongest accurate claim is:
-
-"Optimization 5 introduces a double-buffered grouped GEMM kernel whose control flow is designed to overlap future tile staging with current tile computation. In the current code this is a software-managed precursor to true async copy/TMA support, not a finished hardware-async implementation."
-
-That also means performance wins from Opt 5 should be described as coming from better pipelining structure and cache behavior, not from guaranteed Blackwell-only async transfer machinery.
-
-### TMA Attempt
-
-We also attempted a true TMA-based version of Optimization 5 using CUDA tensor-map descriptors (`CUtensorMap`), host-side `cuTensorMapEncodeTiled`, and device-side `cp_async_bulk_tensor_*` wrappers with block-scoped barriers. The prototype compiled locally with CUDA 12.9 and was structured around a rank-3 tensor map for the concatenated expert-weight tensor. However, when tested on the remote B200 setup used by [`modal_run.py`](/home/rrongali/llm-sys-project/modal_run.py), the kernel did not reach a stable passing state: the TMA path either hung during execution or required a barrier/transaction protocol that was not yet correct.
-
-For that reason, the experimental TMA code was reverted and the repo currently keeps the earlier software-managed double-buffered implementation. In other words, Opt 5 in the checked-in code should still be understood as a non-TMA, non-hardware-async pipeline. A future TMA version is still plausible, but it likely needs to be developed first as a small standalone tile-copy test before being reintegrated into the grouped GEMM kernel.
-
-## Suggested Wording
-
-If you want a tighter version for the report, this would be consistent with the code:
-
-### Optimization 2: Fused Routing
-
-The routing stage is fused into a single kernel with one thread block per token. The token embedding is loaded cooperatively into shared memory, and each thread computes one expert logit using the cached input. Logits remain on-chip in shared memory, where a single thread performs softmax and top-K selection before writing only the selected expert ids and normalized weights to global memory. Compared with the baseline three-kernel routing pipeline, this removes the intermediate `[T, E]` logit tensor, reduces token input reloads during gating, and cuts kernel launch overhead.
-
-### Optimization 3: Grouped GEMM
-
-The per-expert host loop is replaced by a grouped execution flow. A device-side histogram assigns routed tokens to experts using atomic operations, and a prefix sum computes contiguous offsets for each expert bucket. Tokens are then permuted into grouped buffers so that all rows for a given expert are contiguous. This enables each FFN stage to run as a single grouped GEMM across all active experts instead of launching separate GEMMs per expert. The launch structure becomes constant with respect to the number of experts, although the current implementation still performs the prefix sum on the CPU and therefore retains one host-device synchronization point.
-
-### Optimization 4: Fully Fused Expert Kernel
-
-The full MoE forward pass is fused into a single token-parallel kernel. Each block processes one token and uses shared memory to hold the token input, routing logits, intermediate activations, and output accumulator. Routing, top-K selection, expert matvecs, SwiGLU activation, and weighted accumulation all occur within the same kernel, eliminating large intermediate global-memory buffers. The main drawback is that the expert computation is expressed as GEMV rather than GEMM, which lowers arithmetic intensity and makes the approach more sensitive to shared-memory capacity. As a result, this design is most attractive for smaller batch sizes or as a demonstration of maximal fusion.
-
-### Optimization 5: Double-Buffered Grouped GEMM
-
-The grouped GEMM path is further refined with double-buffered shared-memory tiles for expert weights. Two buffers are used so that the next weight tile can be staged while the current tile is being consumed, creating a pipelined execution structure across the reduction dimension. In the current implementation this is done with software-managed shared-memory buffering rather than true asynchronous copy instructions, but the kernel structure is intentionally aligned with a future TMA or `cp.async` implementation. The optimization preserves the grouped-GEMM execution model of Optimization 3 while improving the memory/computation pipeline within each GEMM kernel.
+### The Path Forward (Opt 6)
+To fully capitalize on this structure, our next iterations must:
+1.  **Vectorized DMA:** Cast the global matrices to `float4` so that `cp.async` explicitly fetches 16 bytes sequentially per thread.
+2.  **Tensor Cores (WMMA):** Our current profiling indicates exactly **0.0% Tensor Core Utilization**. Our dot products are constrained by FP32 FMA math rates rather than executing at dense WMMA scale.

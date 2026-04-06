@@ -132,24 +132,20 @@ def parse_csv(path: str) -> list[KernelProfile]:
     with open(path, newline="") as f:
         reader = csv.reader(f)
         headers = None
+        units = None
         for row in reader:
-            # Skip comment/header lines
+            # Skip comment lines
             if not row or row[0].startswith("=="):
                 continue
             if headers is None:
                 headers = row
                 continue
+            if units is None:
+                units = row
+                continue
 
-            # Build a dict from the row
             record = dict(zip(headers, row))
-
-            kernel_name = record.get("Kernel Name", "")
-            metric_name = record.get("Metric Name", "")
-            metric_value = record.get("Metric Value", "0")
-
-            # Find or create the profile for this kernel launch
-            # ncu CSV has one row per (kernel_launch, metric) pair
-            # We group by kernel name (averaging across launches later)
+            kernel_name = record.get("Kernel Name", "").split("(")[0]
             if not kernel_name:
                 continue
 
@@ -163,36 +159,38 @@ def parse_csv(path: str) -> list[KernelProfile]:
                 profile = KernelProfile(name=kernel_name)
                 profiles.append(profile)
 
-            # Map metric to field
-            # Blackwell metrics may have prefixes like "SM_A.TriageCompute."
-            # We search for the base metric name in the record.
-            field_name = None
-            for base_name, f_name in METRIC_MAP.items():
-                if base_name in metric_name:
-                    field_name = f_name
-                    break
-
-            if field_name:
-                try:
-                    # Strip whitespace and unit if present
-                    val_str = metric_value.strip().replace(",", "")
+            # In wide format (raw), we iterate over the known METRIC_MAP keys
+            # and pull them directly from the columns
+            for csv_header_name, field_name in METRIC_MAP.items():
+                if csv_header_name in record:
+                    val_str = record[csv_header_name].strip().replace(",", "")
                     if not val_str or val_str.lower() in ["no data", "n/a"]:
                         continue
+                        
+                    try:
+                        val = float(val_str)
+                    except ValueError:
+                        continue
+
+                    # Lookup the unit from the units row using the csv_header_name index
+                    try:
+                        idx = headers.index(csv_header_name)
+                        metric_unit = units[idx].strip().lower()
+                    except ValueError:
+                        metric_unit = ""
+
+                    # Fix duration metric units since NCU natively uses various scales
+                    if field_name == "duration_ns":
+                        if metric_unit in ["ms", "msecond"]:
+                            val *= 1e6
+                        elif metric_unit in ["us", "usecond"]:
+                            val *= 1e3
+                        elif metric_unit in ["s", "second"]:
+                            val *= 1e9
                     
-                    val = float(val_str)
-                    
-                    # Unit handling: convert ms to ns if needed for duration
-                    metric_unit = record.get("Metric Unit", "").strip().lower()
-                    if field_name == "duration_ns" and metric_unit == "ms":
-                        val *= 1e6
-                    elif field_name == "duration_ns" and metric_unit == "us":
-                        val *= 1e3
-                    
-                    # For metrics collected across multiple launches, we take the max
-                    # or average. Here we just take the latest for simplicity.
-                    setattr(profile, field_name, val)
-                except (ValueError, TypeError):
-                    pass
+                    # Accumulate or max (for metrics like duration, block size, etc.)
+                    # We overwrite it (latest launch)
+                    setattr(profile, field_name, max(getattr(profile, field_name) or 0.0, val))
 
     return profiles
 

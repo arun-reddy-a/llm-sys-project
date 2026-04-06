@@ -44,8 +44,13 @@ You can build and run this project on cloud GPUs using [Modal](https://modal.com
 pip install modal
 modal setup
 
-# 2. Run all tests and benchmarks on a Blackwell B200
-modal run modal_run.py
+# 2. Run smoke benchmark on a Blackwell B200
+modal run modal_run.py --target bench_moe_smoke
+
+# 3. Profile MoE kernels (3-stage pipeline)
+modal run modal_run.py --target profile_moe_1    # Timeline trace
+modal run modal_run.py --target profile_moe_2    # Deep kernel metrics
+modal run modal_run.py --target profile_moe_3    # Automated diagnosis
 ```
 
 See [docs/modal/README.md](docs/modal/README.md) for more details.
@@ -70,22 +75,39 @@ Benchmark iterations can be configured via CLI arguments:
 
 ```
 .
-├── Makefile                        # Build system
+├── Makefile                        # Build system (bench, test, profile targets)
 ├── README.md
+├── modal_run.py                    # Modal cloud runner (B200 GPU)
 ├── Proposal.pdf                    # Project proposal
 ├── kernels/
 │   ├── moe/
 │   │   ├── naive_moe.cuh           # MoE config struct + kernel declarations
-│   │   └── naive_moe.cu            # Naive MoE kernel implementations
+│   │   └── naive_moe.cu            # MoE kernel implementations (Naive → Opt5)
 │   └── dsa/
 │       ├── naive_dsa.cuh           # DSA config struct + kernel declarations
-│       └── naive_dsa.cu            # Naive DSA kernel implementations
+│       └── naive_dsa.cu            # DSA kernel implementations
 ├── tests/
 │   ├── test_moe.cu                 # MoE correctness tests (GPU vs CPU reference)
 │   └── test_dsa.cu                 # DSA correctness tests (GPU vs CPU reference)
 ├── benchmarks/
-│   ├── bench_moe.cu                # MoE latency benchmarks
-│   └── bench_dsa.cu                # DSA latency benchmarks
+│   ├── bench_moe.cu                # MoE full benchmark (all variants × configs)
+│   ├── bench_moe_smoke.cu          # MoE smoke benchmark (NVTX-instrumented, for profiling)
+│   ├── bench_dsa.cu                # DSA latency benchmarks
+│   └── simple_vadd.cu              # Simple vector-add (profiling toolchain validation)
+├── profiling/
+│   ├── profile_moe.sh              # 3-stage profiling orchestrator (nsys → ncu → diagnosis)
+│   ├── diagnose_moe.py             # Decision-tree bottleneck analyzer
+│   ├── analyze_ncu.py              # Lightweight NCU CSV parser
+│   └── results/                    # Generated .nsys-rep, .ncu-rep, .csv files
+├── docs/
+│   ├── moe/
+│   │   ├── README.md               # MoE optimization descriptions (Opt2–Opt5)
+│   │   ├── PROFILING.md            # Profiling decision tree + metrics reference
+│   │   └── BLACKWELL_PROFILING_PEDAGOGY.md  # Step-by-step Blackwell profiling guide
+│   ├── modal/
+│   │   └── README.md               # Modal cloud setup instructions
+│   └── external/
+│       └── nsight_systems_user_guide.html  # Local copy of Nsight docs
 └── utils/
     └── cuda_utils.cuh              # CUDA error checking, GPU timer, helpers
 ```
