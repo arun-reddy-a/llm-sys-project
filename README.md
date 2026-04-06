@@ -68,6 +68,28 @@ Benchmark iterations can be configured via CLI arguments:
 ./build/bench_moe <warmup> <iters>   # default: 10 warmup, 50 iters
 ```
 
+---
+
+## 🛠 The Iteration & Profiling Methodology
+
+When iteratively accelerating the `moe_forward` layers from the naive baseline up to the massive `64x64` pipeline scales across 8 structural configurations, we relied entirely on hardware-level execution traces to verify bottlenecks natively.
+
+### 1. The Target Benchmark
+Operating profile traces on immense token batches (like `T=2048`) intrinsically loops the compiler and buries fundamental computational bottlenecks beneath extremely massive `.sqlite` sizes. To evaluate hardware metrics immediately, we constructed `bench_moe_smoke.cu` replicating exactly a **miniature DeepSeek-V3 Scale**:
+* **Tokens (T):** `512`
+* **Total Global Experts (E):** `256`
+* **Local Active Experts (EL):** `32`
+* **Top-K Routing (K):** `8`
+* **Dimensional matrices:** `D=7168`, `I=2048`
+
+Locking exactly into these bounds provided fixed, perfectly predictable execution thresholds where our architecture modifications logically scaled from $42.9ms$ down to $8.3ms$.
+
+### 2. The Profiler Pipeline
+Executing `modal run modal_run.py --target profile_moe_full` orchestrated our custom 3-Stage trace workflow:
+1. **Nsight Systems (`nsys`):** Established Timeline limits. Discovered exactly where the kernel hung synchronously behind the host, identifying the catastrophic Host Launch overhead natively solved via Grouped-GEMMs.
+2. **Nsight Compute (`ncu`):** Deep-traced NVTX tags. Investigated deep mathematical thresholds like memory pipelining waits (`__pipeline_wait_prior`), Occupancy, and Instruction-Level Parallelism (ILP).
+3. **Automated Breakdown (`diagnose_moe.py`):** Automatically piped massive trace matrices exported from the NCU framework directly into a custom Python script, systematically identifying if the kernel was officially `LATENCY-BOUND`, `COMPUTE-BOUND` or suffering from L2 cache thrashings (which guided our transition fully into `cp.async` DMA allocations).
+
 ## Project Structure
 
 ```
