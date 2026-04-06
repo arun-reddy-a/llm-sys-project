@@ -22,9 +22,15 @@ This profiling pipeline implements the **measure → identify → fix → re-mea
 # On B200 via Modal:
 modal run modal_run.py --target profile_moe_1    # Stage 1: Timeline
 modal run modal_run.py --target profile_moe_2    # Stage 2: Deep metrics
-modal run modal_run.py --target profile_moe_3    # Stage 3: Diagnosis
-modal run modal_run.py --target profile_moe_full # All 3 stages
+modal run modal_run.py --target profile_moe_full # Runs 1 & 2, fetches files, runs diagnosis
 ```
+
+### The Auto-Fetch Pipeline
+When you execute profiling via `modal_run.py`, the system generates a unique **`RUN_ID`**. 
+1. The `RUN_ID` is passed inside the cloud container to guarantee all tools output uniformly named files.
+2. The massive `.ncu-rep` and `.sqlite` binaries are saved permanently on the cloud volume `llm-sys-profiling-results`.
+3. `modal_run.py` **automatically downloads** those artifacts to your local `./profiling/local_results/` folder as soon as the run is completed.
+4. You run your analysis tools (like `diagnose_moe.py`) locally on the fetched CSV.
 
 Or invoke the script directly:
 
@@ -91,15 +97,20 @@ Collects ~30 metrics organized into 4 groups:
 
 Uses `--launch-skip 50 --launch-count 20` to skip warmup kernel launches and profile only steady-state iterations.
 
-### Stage 3: Automated Diagnosis
+### Stage 3: Automated Diagnosis (Local Analysis)
 
-**Goal**: Parse NCU metrics through the decision tree and output a human-readable report.
+**Goal**: Parse NCU metrics through the decision tree and output a human-readable report without executing another cloud container.
 
-`diagnose_moe.py` reads the NCU CSV export and for each kernel:
-1. Classifies it via roofline thresholds
-2. Drills down into the appropriate analysis branch
-3. Identifies the dominant bottleneck (e.g., "Long Scoreboard stall at 35%")
-4. Recommends specific fixes
+After the auto-fetch downloads your results, you process them locally:
+```bash
+python3 profiling/diagnose_moe.py profiling/local_results/moe_Opt5_<RUN_ID>_ncu.csv
+```
+
+`diagnose_moe.py` parses the CSV and for each kernel:
+1. Translates `ms`/`us`/`ns` execution timings.
+2. Classifies it via roofline thresholds.
+3. Drills down into the appropriate analysis branch.
+4. Identifies the dominant bottleneck and recommends a fix.
 
 ## Metrics Cheatsheet
 
