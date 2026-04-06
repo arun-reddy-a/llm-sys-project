@@ -112,3 +112,5 @@ To finally break the barrier, Optimization 8 radically scales up the assigned pr
 Executing the 64x64 union-adjusted Tensor hardware computations crashed execution limits from `42.9ms` directly down to a blistering **8.3ms**, successfully conquering latency blockings up to our B200 threshold!
 
 *Note: For further development, discovering exact throughput boundaries across differing generation nodes (eg Ampere vs Hopper vs Blackwell) intrinsically depends heavily on the Grid Shapes mapped (64x128, 128x128). An autotuner parameterizing these definitions locally is highly recommended!*
+
+- [**THEORETICAL_LIMITS.md**](THEORETICAL_LIMITS.md): A mathematical roofline analysis of B200 Grouped-GEMM throughput constraints and memory boundaries.
