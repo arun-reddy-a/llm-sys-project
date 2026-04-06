@@ -91,5 +91,24 @@ To fix the structural alignment breakdown, Optimization 6 scales the memory pipe
 
 ---
 
-## Optimization 7: Tensor Cores (Next Steps)
-We have successfully decoupled memory execution, leaving the strict compute kernel. Moving into Opt 7, we must swap the scalar FMA thread loops explicitly into **Warp Matrix Multiply Accumulates (WMMA)** instructions using the `<mma.h>` Tensor Core API.
+## Optimization 7: Tensor Cores (Hitting Latency Bounds)
+We successfully decoupled memory execution, leaving the strict compute kernel. Optimization 7 abandoned the scalar `sum += As * Bs` FMA execution entirely. Overriding the registers exclusively with **Warp Matrix Multiply Accumulates (WMMA)** instructions using the `<mma.h>` Tensor Core API executing `wmma::precision::tf32`.
+
+### The Small-Tile Starvation
+Instead of getting a massive speedup, the execution time effectively plateaued at **42.9ms**, but Nsight Compute completely re-classified the bottleneck from COMPUTE-BOUND onto completely **LATENCY-BOUND**. 
+Assigning 16x16 tiles meant only 1 Warp was physically active performing mathematical dot-products structurally mapped to the Tensor Blocks. Because the Tensor cores are overwhelmingly fast (evaluating 16x16 blocks in mere clock cycles), math disappeared from the profile trace, instantaneously parking all active work at the async queue synchronization boundaries (`__pipeline_wait_prior`). The Streaming Multiprocessors were totally starved for computational payloads while DMA requests lagged natively. 
+
+---
+
+## Optimization 8: The 64x64 SMEM Union Scale
+
+To finally break the barrier, Optimization 8 radically scales up the assigned processing volume mathematically. Rather than tiny 16x16 dispatches tracking 256 output elements, the thread grids natively execute monstrous **64x64 matrix chunks** (evaluating exactly 4096 elements per block). 
+
+1. **8-Warp Saturation:** Instead of assigning a solitary Warp, all 8 available internal Thread Warps are physically assigned sections of the computation grid dynamically (`warp_row` and `warp_col` math offsets). 
+2. **The Union Limit:** A 64x64 processing slice physically demands ~54KB of internal buffer space (32KB Async double buffers + 16KB C allocations). This natively crashes default executions (`0xc000 maximum boundary reached` - meaning we passed the rigid 48KB SM structure limit). 
+3. **The Buffer Overlay Hack:** Since the evaluation (`Cs`) buffer exclusively aggregates the epilogue states (when Async fetching is fully depleted), defining a memory `union` across the structures physically forces the Epilogue output matrices to overlay identically across the Async input memory bounds. This perfectly truncates the physical allocation back underneath the structural ceiling. 
+
+### The Ultimate Run
+Executing the 64x64 union-adjusted Tensor hardware computations crashed execution limits from `42.9ms` directly down to a blistering **8.3ms**, successfully conquering latency blockings up to our B200 threshold!
+
+*Note: For further development, discovering exact throughput boundaries across differing generation nodes (eg Ampere vs Hopper vs Blackwell) intrinsically depends heavily on the Grid Shapes mapped (64x128, 128x128). An autotuner parameterizing these definitions locally is highly recommended!*
