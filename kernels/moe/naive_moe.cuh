@@ -112,6 +112,11 @@ void moe_forward_deepseek(const float* input, const float* gate_weight, const fl
                           const float* w1, const float* w2, float* output,
                           const MoeConfig& cfg, cudaStream_t stream = 0);
 
+// 8. DEEPSEEK-V3 Naive reference (GPU execution, loop-based experts)
+void moe_forward_deepseek_naive(const float* input, const float* gate_weight, const float* gate_bias,
+                                const float* w1, const float* w2, float* output,
+                                const MoeConfig& cfg, cudaStream_t stream = 0);
+
 // Defaults to the current best available implementation in this repo.
 void moe_forward(const float* input, const float* gate_weight,
                  const float* w1, const float* w2, float* output,

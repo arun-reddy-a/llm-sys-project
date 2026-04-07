@@ -38,6 +38,7 @@ $(BENCH_MOE): benchmarks/bench_moe.cu $(MOE_SRC) | $(BUILD_DIR)
 
 bench_moe_smoke: $(MOE_SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -lnvToolsExt -o build/bench_moe_smoke benchmarks/bench_moe_smoke.cu $(MOE_SRC)
+	VARIANT=$(VARIANT) ./build/bench_moe_smoke
 
 # Debug builds (with device-side debugging)
 debug_tests: | $(BUILD_DIR)
@@ -125,7 +126,7 @@ profile_moe_2: bench_moe_smoke
 
 # Stage 3: Automated Diagnosis (parse NCU metrics into recommendations)
 profile_moe_3:
-	./profiling/profile_moe.sh --stage 3 --variant $(VARIANT) --run-id "$(RUN_ID)"
+	./profiling/profile_moe.sh --stage 3 --variant $(VARIANT) --run-id "$(RUN_ID)" --bench-bin ./build/bench_moe_smoke
 
 # All 3 stages in sequence
 profile_moe_full: profile_moe_1 profile_moe_2 profile_moe_3

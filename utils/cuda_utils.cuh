@@ -95,31 +95,26 @@ struct DeviceBuf {
 
     DeviceBuf() = default;
     explicit DeviceBuf(int n) : count(n) {
-        CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(T)));
+        CUDA_CHECK(cudaMalloc(&ptr, (size_t)n * sizeof(T)));
     }
     ~DeviceBuf() { if (ptr) cudaFree(ptr); }
-
-    void alloc(int n) {
-        if (ptr) cudaFree(ptr);
-        count = n;
-        CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(T)));
-    }
-    void upload(const T* host) {
-        CUDA_CHECK(cudaMemcpy(ptr, host, count * sizeof(T), cudaMemcpyHostToDevice));
-    }
-    void download(T* host) const {
-        CUDA_CHECK(cudaMemcpy(host, ptr, count * sizeof(T), cudaMemcpyDeviceToHost));
-    }
-    void zero() {
-        CUDA_CHECK(cudaMemset(ptr, 0, count * sizeof(T)));
-    }
 
     void resize(int n) {
         if (n > count) {
             if (ptr) CUDA_CHECK(cudaFree(ptr));
             count = n;
-            CUDA_CHECK(cudaMalloc(&ptr, n * sizeof(T)));
+            CUDA_CHECK(cudaMalloc(&ptr, (size_t)n * sizeof(T)));
         }
+    }
+
+    void upload(const T* host, cudaStream_t stream = 0) {
+        CUDA_CHECK(cudaMemcpyAsync(ptr, host, (size_t)count * sizeof(T), cudaMemcpyHostToDevice, stream));
+    }
+    void download(T* host, cudaStream_t stream = 0) const {
+        CUDA_CHECK(cudaMemcpyAsync(host, ptr, (size_t)count * sizeof(T), cudaMemcpyDeviceToHost, stream));
+    }
+    void zero(cudaStream_t stream = 0) {
+        CUDA_CHECK(cudaMemsetAsync(ptr, 0, (size_t)count * sizeof(T), stream));
     }
 
     DeviceBuf(const DeviceBuf&) = delete;

@@ -95,13 +95,15 @@ This document chronicles the transition from standard latency-bound kernels to t
 
 The following metrics represent the production **DeepSeek-V3 MoE** implementation (fused sigmoid-bias-group routing + 64x64 Union-Tiled GEMM).
 
-| Variant | Config (E=256, K=8, D=7k, I=2k) | Min Latency | Mean Latency | Throughput |
+| Variant | Config (E=256, K=8, D=7168, I=2048) | Min Latency | Mean Latency | Throughput |
 | :--- | :--- | :--- | :--- | :--- |
-| **DeepSeek-V3** | T=64 | 2.96 ms | 3.00 ms | 21,343 Tok/s |
-| **DeepSeek-V3** | T=128 | 2.70 ms | 3.46 ms | 36,971 Tok/s |
-| **DeepSeek-V3** | T=512 | 6.77 ms | 7.22 ms | 70,899 Tok/s |
-| **DeepSeek-V3** | T=1024 | 13.61 ms | 13.75 ms | 74,470 Tok/s |
-| **DeepSeek-V3** | T=4096 | 45.38 ms | 46.54 ms | **88,004 Tok/s** |
+| **DeepSeek-V3** | T=64 | 1.58 ms | 1.59 ms | 40,287 Tok/s |
+| **DeepSeek-V3** | T=128 | 1.32 ms | 1.33 ms | 96,400 Tok/s |
+| **DeepSeek-V3** | T=256 | 2.08 ms | 2.08 ms | 123,054 Tok/s |
+| **DeepSeek-V3** | T=512 | 1.67 ms | 1.67 ms | 306,251 Tok/s |
+| **DeepSeek-V3** | T=1024 | 4.41 ms | 4.42 ms | 231,781 Tok/s |
+| **DeepSeek-V3** | T=2048 | 5.68 ms | 5.68 ms | 360,436 Tok/s |
+| **DeepSeek-V3** | T=4096 | 10.22 ms | 10.23 ms | **400,403 Tok/s** |
 
 ---
 
@@ -112,7 +114,7 @@ The following metrics represent the production **DeepSeek-V3 MoE** implementatio
 | **Opt 2** | Naive Grouped GEMM | 4,200 Tok/s | 65.0 ms |
 | **Opt 3** | Cooperative Tiling (32x32) | 48,000 Tok/s | 12.5 ms |
 | **Opt 5** | Union Overlay (64x64) | 85,000 Tok/s | 4.4 ms |
-| **DeepSeek-V3** | **Integrated Production Routing** | **88,004 Tok/s** | **2.9 ms** |
+| **DeepSeek-V3** | **Integrated Production Routing** | **400,403 Tok/s** | **1.58 ms** |
 
 ---
 

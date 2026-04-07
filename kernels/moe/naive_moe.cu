@@ -191,17 +191,22 @@ __global__ void deepseek_selection_kernel(const float* __restrict__ logits,
         s_group_scores[gn] = g_top1 + g_top2;
     }
 
-    // 3) Select top groups
+    // 3) Select top groups with stable tie-break
     int top_groups[8]; 
     for (int i = 0; i < N_GROUP; i++) top_groups[i] = i;
     for (int i = 0; i < TOPK_GROUP; i++) {
         int max_idx = i;
-        for (int j = i + 1; j < N_GROUP; j++) 
-            if (s_group_scores[top_groups[j]] > s_group_scores[top_groups[max_idx]]) max_idx = j;
+        for (int j = i + 1; j < N_GROUP; j++) {
+            float s_j = s_group_scores[top_groups[j]];
+            float s_max = s_group_scores[top_groups[max_idx]];
+            if (s_j > s_max || (s_j == s_max && top_groups[j] < top_groups[max_idx])) {
+                max_idx = j;
+            }
+        }
         int tmp = top_groups[i]; top_groups[i] = top_groups[max_idx]; top_groups[max_idx] = tmp;
     }
 
-    // 4) Global Top-K
+    // 4) Global Top-K with stable tie-break
     int* out_idx = expert_indices + t * K;
     float* out_wt = expert_weights + t * K;
     for (int k = 0; k < K; k++) { out_idx[k] = -1; out_wt[k] = -FLT_MAX; }
@@ -213,7 +218,9 @@ __global__ void deepseek_selection_kernel(const float* __restrict__ logits,
             float val = s_wb[e];
             int min_k = 0;
             for (int k = 1; k < K; k++) if (out_wt[k] < out_wt[min_k]) min_k = k;
-            if (val > out_wt[min_k]) { out_wt[min_k] = val; out_idx[min_k] = e; }
+            if (val > out_wt[min_k] || (val == out_wt[min_k] && e < out_idx[min_k])) { 
+                out_wt[min_k] = val; out_idx[min_k] = e; 
+            }
         }
     }
 
@@ -1168,96 +1175,144 @@ void moe_forward_opt5(const float* d_input, const float* d_gate_weight,
     moe_forward_deepseek(d_input, d_gate_weight, s_opt5_bias.ptr, d_w1, d_w2, d_output, cfg, stream);
 }
 
-// 7. DEEPSEEK-V3 Version
+// 8. DEEPSEEK-V3 Naive reference (GPU execution, loop-based experts)
+void moe_forward_deepseek_naive(const float* d_input, const float* d_gate_weight, const float* d_gate_bias,
+                                const float* d_w1, const float* d_w2, float* d_output,
+                                const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    // 1. Gating logic (DeepSeek)
+    DeviceBuf<int> s_indices(T * K);
+    DeviceBuf<float> s_weights(T * K);
+    moe_gate_deepseek(d_input, d_gate_weight, d_gate_bias, s_indices.ptr, s_weights.ptr, cfg, stream);
+
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
+
+    DeviceBuf<float> gathered(T * D);
+    DeviceBuf<int>   token_map(T);
+    DeviceBuf<int>   d_count(1);
+    DeviceBuf<float> gemm1_out(T * 2 * I);
+    DeviceBuf<float> act_out(T * I);
+    DeviceBuf<float> gemm2_out(T * D);
+
+    // Only compute over local experts [0..E_local)
+    for (int e = 0; e < E_local; e++) {
+        moe_gather(d_input, s_indices.ptr, s_weights.ptr, e, gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
+        int h_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (h_count == 0) continue;
+
+        // GEMM1: naive
+        {
+            int M_ = h_count, N_ = 2 * I, K_ = D;
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(gathered.ptr, d_w1 + (size_t)e * 2 * I * D, gemm1_out.ptr, M_, N_, K_);
+        }
+        swiglu_strided_kernel<<<(h_count * I + 255) / 256, 256, 0, stream>>>(gemm1_out.ptr, act_out.ptr, h_count, I);
+        // GEMM2: naive
+        {
+            int M_ = h_count, N_ = D, K_ = I;
+            dim3 block(TILE_SIZE, TILE_SIZE);
+            dim3 grid((N_ + TILE_SIZE - 1) / TILE_SIZE, (M_ + TILE_SIZE - 1) / TILE_SIZE);
+            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(act_out.ptr, d_w2 + (size_t)e * D * I, gemm2_out.ptr, M_, N_, K_);
+        }
+        moe_scatter(gemm2_out.ptr, token_map.ptr, s_weights.ptr, s_indices.ptr, e, d_output, h_count, cfg, stream);
+    }
+}
+
+// 7. DEEPSEEK-V3 Production Implementation
 void moe_forward_deepseek(const float* d_input, const float* d_gate_weight, const float* d_gate_bias,
                           const float* d_w1, const float* d_w2, float* d_output,
                           const MoeConfig& cfg, cudaStream_t stream) {
     int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
     int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
 
-    // Persistent scratch buffers to eliminate cudaMalloc jitter (especially at T=2048)
-    static DeviceBuf<int>   s_expert_indices, s_expert_counts, s_token_idx_in_expert, s_expert_offsets, s_m_tile_offsets, s_grouped_token_map;
-    static DeviceBuf<float> s_expert_weights, s_grouped_input, s_g_gemm1_out, s_g_act_out, s_g_gemm2_out;
+    // PRE-ALLOCATED PERSISTENT SCRATCH (Zero jitter for deep inference)
+    static DeviceBuf<int>   s_indices, s_counts, s_token_idx, s_offsets, s_tile_offsets, s_map;
+    static DeviceBuf<float> s_weights, s_grouped_in, s_gemm1, s_act, s_gemm2;
 
-    s_expert_indices.resize(T * K);
-    s_expert_weights.resize(T * K);
-    moe_gate_deepseek(d_input, d_gate_weight, d_gate_bias, s_expert_indices.ptr, s_expert_weights.ptr, cfg, stream);
+    // 1. Gating logic (cuBLAS + Selection)
+    s_indices.resize(T * K);
+    s_weights.resize(T * K);
+    moe_gate_deepseek(d_input, d_gate_weight, d_gate_bias, s_indices.ptr, s_weights.ptr, cfg, stream);
 
-    s_expert_counts.resize(E + 1);
-    s_expert_counts.zero();
-    s_token_idx_in_expert.resize(T * K);
+    // 2. Expert Grouping & Global Offset Calculation
+    // We use a small host sync here to compute M-dimension tiles for the Grouped GEMM.
+    // In full production (T=4096), this is negligible.
+    s_counts.resize(E + 1);
+    s_counts.zero(stream);
+    s_token_idx.resize(T * K);
     expert_grouping_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
-        s_expert_indices.ptr, s_expert_counts.ptr, s_token_idx_in_expert.ptr, T, K, E
+        s_indices.ptr, s_counts.ptr, s_token_idx.ptr, T, K, E
     );
 
-    std::vector<int> h_counts(E + 1);
-    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), s_expert_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::vector<int> h_offsets(E + 1);
-    h_offsets[0] = 0;
-    for (int i = 0; i < E; i++) h_offsets[i+1] = h_offsets[i] + h_counts[i];
-    s_expert_offsets.resize(E + 1);
-    s_expert_offsets.upload(h_offsets.data());
+    // Fast Host-Trip for Cluster Mapping
+    static std::vector<int> h_counts, h_offsets, h_tiles;
+    h_counts.resize(E + 1);
+    CUDA_CHECK(cudaMemcpyAsync(h_counts.data(), s_counts.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream)); // Minimal sync for block-scheduling
 
-    int total_local = h_offsets[E_local];
-    if (total_local == 0) return;
-
-    std::vector<int> h_m_tile_offsets(E_local + 1, 0);
-    for (int i = 0; i < E_local; i++) {
-        int tiles = (h_counts[i] + 64 - 1) / 64;
-        h_m_tile_offsets[i+1] = h_m_tile_offsets[i] + tiles;
+    h_offsets.assign(E + 1, 0);
+    h_tiles.assign(E_local + 1, 0);
+    for (int i = 0; i < E; i++) {
+        h_offsets[i+1] = h_offsets[i] + h_counts[i];
+        if (i < E_local) {
+            h_tiles[i+1] = h_tiles[i] + (h_counts[i] + 64 - 1) / 64;
+        }
     }
-    s_m_tile_offsets.resize(E_local + 1);
-    CUDA_CHECK(cudaMemcpyAsync(s_m_tile_offsets.ptr, h_m_tile_offsets.data(), (E_local + 1) * sizeof(int), cudaMemcpyHostToDevice, stream));
+    
+    s_offsets.resize(E + 1); 
+    s_offsets.upload(h_offsets.data(), stream);
+    s_tile_offsets.resize(E_local + 1);
+    s_tile_offsets.upload(h_tiles.data(), stream);
 
     int total_active = h_offsets[E];
-    s_grouped_input.resize(total_active * D);
-    s_grouped_token_map.resize(total_active);
+    int total_local  = h_offsets[E_local];
+    if (total_active == 0) return;
+
+    // 3. Reordering tokens to Expert-Contiguous groups
+    s_grouped_in.resize(total_active * D);
+    s_map.resize(total_active);
     group_reorder_kernel<<<T * K, 256, 0, stream>>>(
-        d_input, s_expert_indices.ptr, s_expert_offsets.ptr, s_token_idx_in_expert.ptr,
-        s_grouped_input.ptr, s_grouped_token_map.ptr, T, K, D
+        d_input, s_indices.ptr, s_offsets.ptr, s_token_idx.ptr,
+        s_grouped_in.ptr, s_map.ptr, T, K, D
     );
 
+    // 4. Grouped GEMM Phase (Blackwell-optimized)
     CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
-    s_g_gemm1_out.resize(total_local * 2 * I);
-    s_g_act_out.resize(total_local * I);
-    s_g_gemm2_out.resize(total_local * D);
+    if (total_local > 0) {
+        s_gemm1.resize(total_local * 2 * I);
+        s_act.resize(total_local * I);
+        s_gemm2.resize(total_local * D);
 
-    {
-        dim3 block(256);
-        int total_m_tiles = h_m_tile_offsets[E_local];
-        dim3 grid((2 * I + 64 - 1) / 64, total_m_tiles);
-        if (total_m_tiles > 0) {
-            grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-                s_grouped_input.ptr, d_w1, s_g_gemm1_out.ptr, s_expert_offsets.ptr, s_m_tile_offsets.ptr,
-                D, 2 * I, E_local);
-        }
+        int total_m_tiles = h_tiles[E_local];
+        
+        // GEMM 1: Input -> Intermediate
+        grouped_gemm_blackwell_async_kernel<<<dim3((2 * I + 64 - 1) / 64, total_m_tiles), 256, 0, stream>>>(
+            s_grouped_in.ptr, d_w1, s_gemm1.ptr, s_offsets.ptr, s_tile_offsets.ptr, D, 2 * I, E_local);
+
+        // Activation (SwiGLU)
+        swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(s_gemm1.ptr, s_act.ptr, total_local, I);
+
+        // GEMM 2: Intermediate -> Output
+        grouped_gemm_blackwell_async_kernel<<<dim3((D + 64 - 1) / 64, total_m_tiles), 256, 0, stream>>>(
+            s_act.ptr, d_w2, s_gemm2.ptr, s_offsets.ptr, s_tile_offsets.ptr, I, D, E_local);
+
+        // 5. Accumulate Results
+        grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
+            s_gemm2.ptr, s_map.ptr, s_weights.ptr, s_indices.ptr, s_offsets.ptr, d_output, T, K, D, E_local
+        );
     }
-    swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(s_g_gemm1_out.ptr, s_g_act_out.ptr, total_local, I);
-    {
-        dim3 block(256);
-        int total_m_tiles = h_m_tile_offsets[E_local];
-        dim3 grid((D + 64 - 1) / 64, total_m_tiles);
-        if (total_m_tiles > 0) {
-            grouped_gemm_blackwell_async_kernel<<<grid, block, 0, stream>>>(
-                s_g_act_out.ptr, d_w2, s_g_gemm2_out.ptr, s_expert_offsets.ptr, s_m_tile_offsets.ptr,
-                I, D, E_local);
-        }
-    }
-    grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
-        s_g_gemm2_out.ptr, s_grouped_token_map.ptr, s_expert_weights.ptr,
-        s_expert_indices.ptr, s_expert_offsets.ptr, d_output, T, K, D, E_local
-    );
 }
 
 void moe_forward(const float* d_input, const float* d_gate_weight,
                  const float* d_w1, const float* d_w2, float* d_output,
                  const MoeConfig& cfg, cudaStream_t stream) {
-    // Produce a temporary bias since the standard signature doesn't include one
     static DeviceBuf<float> s_default_bias;
     s_default_bias.resize(cfg.num_experts);
-    s_default_bias.zero(); 
-
-    // Point to the optimized DeepSeek path as the new standard
+    s_default_bias.zero(stream); 
     moe_forward_deepseek(d_input, d_gate_weight, s_default_bias.ptr, d_w1, d_w2, d_output, cfg, stream);
 }

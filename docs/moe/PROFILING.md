@@ -109,6 +109,10 @@ Collects ~30 metrics organized into 4 groups:
 
 Uses `--launch-skip 50 --launch-count 20` to skip warmup kernel launches and profile only steady-state iterations.
 
+> [!WARNING]
+> **The Observer Effect**: NCU tracing fundamentally breaks natural hardware execution. To collect exhaustive metrics, NCU serializes kernel launches, disables caching mechanisms to insert hardware counters, and executes multiple "replay passes" (averaging 20-30 replays per kernel). Consequently, *NCU timeline durations are artificially inflated* (e.g., reporting 8.3ms for a kernel that natively takes 1.6ms). 
+> **Always trust `bench_moe.cu` for true wall-clock timings.** Use NCU strictly for identifying *where* the relative bottlenecks are (e.g. occupancy constraints).
+
 ### Stage 3: Automated Diagnosis (Local Analysis)
 
 **Goal**: Parse NCU metrics through the decision tree and output a human-readable report without executing another cloud container.

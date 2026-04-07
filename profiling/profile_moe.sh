@@ -73,7 +73,7 @@ build_profile_binary() {
     mkdir -p "${BUILD_DIR}"
 
     # Build the regular benchmark binary
-    nvcc -std=c++17 -O2 -arch=native -lineinfo -lnvToolsExt \
+    nvcc -std=c++17 -O2 -arch=native -lineinfo -lnvToolsExt -lcublas \
         -o "${BENCH_BIN}" \
         "${PROJECT_ROOT}/benchmarks/bench_moe.cu" \
         "${PROJECT_ROOT}/kernels/moe/naive_moe.cu"
@@ -290,7 +290,7 @@ run_ncu() {
         --force-overwrite \
         --page raw \
         "${BENCH_BIN}" "${VARIANT}" \
-        2>&1 | tee "${NCU_OUT}_console.log"
+        > "${NCU_OUT}_console.log" 2>&1
 
     echo ""
     echo "  ▸ Nsight Compute report saved: ${NCU_OUT}.ncu-rep"
