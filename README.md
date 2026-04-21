@@ -168,12 +168,12 @@ Listed in order from most basic to most advanced. Each builds on the previous.
 
 2. - [x] **Fuse two dot products into a single GEMM** -- Concatenate `[q_nope | q_pe]` (Dc+Dp = 576 dims) and `[K_c | K_p]` along the head dimension. Yields a single 576-dim dot product per (query, kv) pair, eliminating one kernel launch and halving score-tensor DRAM traffic.
 
-3. **Batch across queries** -- Replace the per-query serial computation with a batched GEMM over all queries simultaneously (analogous to Grouped-GEMM in MoE). Enables SM packing and amortises launch overhead.
+3. - [x] **Batch across queries** -- Replace the per-query serial computation with tiled batched GEMMs over all queries simultaneously for score and output projection. This packs independent query work into a single launch shape, improves SM occupancy, and amortises launch overhead. (completed)
 
-4. **FlashAttention-style online softmax** -- Tile over the S selected KV tokens in chunks, carrying running max/sum accumulators in registers. Never materialises the full `[Q, H, S]` attention weight matrix in DRAM. Memory footprint drops from O(S) to O(tile_size).
+4. - [x] **FlashAttention-style online softmax** -- Tile over the S selected KV tokens in chunks, carrying running max/sum accumulators in registers and fusing softmax with value accumulation. The forward path no longer materialises the normalized `[Q, H, S]` attention weight matrix in DRAM. (completed)
 
-5. **Sort sparse indices by page** -- Sort the selected KV indices by page ID before execution so that KV memory accesses are coalesced at page granularity (page_size=64 tokens). Improves L2 cache hit rate and DRAM burst efficiency.
+5. - [x] **Sort sparse indices by page** -- Sort the selected KV indices by page ID before execution so that KV memory accesses are coalesced at page granularity. The DSA forward path now reorders each query's sparse list by `(page_id, token_id)` prior to gather. (completed)
 
-6. **Fuse KV gather into compute pipeline via TMA** -- Replace the standalone gather pass with hardware-managed TMA prefetches driven directly by the sparse index list. The gather and compute overlap in a pipelined fashion, hiding gather latency entirely.
+6. - [x] **Fuse KV gather into compute pipeline** -- Replace the standalone gathered K/V buffers with a sparse-index-driven compute path that loads K directly in the score GEMM and V directly in the online softmax/output kernel. This removes the explicit gather DRAM round-trip and lays the groundwork for later TMA-specific prefetching. (completed)
 
-7. **TMEM-based asynchronous KV tile prefetching (Blackwell SM 10.0)** -- Use Tensor Memory hardware to speculatively prefetch upcoming KV tiles while Tensor Cores compute the current tile, achieving multi-stage pipeline overlap without manual cp.async choreography.
+7. - [x] **TMEM-inspired asynchronous KV tile prefetching** -- In the portable path, stage sparse KV indices in shared memory and issue L2 prefetches for upcoming K/V rows while the current tile is being processed. This approximates the intended Blackwell TMEM behavior without relying on unreleased architecture-specific APIs. (completed)
