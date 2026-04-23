@@ -1,2 +1,10 @@
 build/
-*txt
+*.txt
+*.pyc
+__pycache__/
+results.jsonl
+profiling/local_results/
+profiling/results/
+*.nsys-rep
+*.sqlite
+*.ncu-rep
