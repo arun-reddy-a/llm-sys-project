@@ -528,6 +528,81 @@ void moe_scatter(const float* expert_out, const int* token_map,
     CUDA_CHECK(cudaGetLastError());
 }
 
+// 0. TRUE NAIVE: pedagogical floor — zero shared-memory, no fusions.
+// ===================================================================
+// naive_gemm_kernel_impl used here is:  C[row,col] = sum_k A[row,k]*B[k,col]
+// where B is stored row-major [K_,N].  Both A and B rows are streamed from
+// DRAM on every k — no data reuse whatsoever.
+void moe_forward_true_naive(const float* d_input, const float* d_gate_weight,
+                            const float* d_w1, const float* d_w2, float* d_output,
+                            const MoeConfig& cfg, cudaStream_t stream) {
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    // --- Routing: 3 separate kernels, full DRAM round-trip through logits ---
+    DeviceBuf<float> d_logits(T * E);
+    // logits[t, e] = dot(input[t], gate_weight[e])
+    // One block per token, one thread per expert — both stream full rows from DRAM.
+    gate_logits_kernel<<<T, E, 0, stream>>>(d_input, d_gate_weight, d_logits.ptr, T, E, D);
+    // Per-token softmax — serial loop over E in a single thread.
+    softmax_experts_kernel<<<(T + 255) / 256, 256, 0, stream>>>(d_logits.ptr, T, E);
+    DeviceBuf<int>   expert_indices(T * K);
+    DeviceBuf<float> expert_weights(T * K);
+    // Per-token top-K — heap maintained in registers, O(K*E) per token.
+    topk_kernel<<<(T+255)/256, 256, 0, stream>>>(d_logits.ptr, expert_indices.ptr, expert_weights.ptr, T, E, K);
+
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0, T * D * sizeof(float), stream));
+
+    DeviceBuf<float> gathered(T * D);
+    DeviceBuf<int>   token_map(T);
+    DeviceBuf<int>   d_count(1);
+    // W1 layout for this variant: row-major [2*I, D] (not transposed)
+    // so we use naive_gemm_kernel_impl: C = A * B with B stored [K_,N].
+    DeviceBuf<float> gemm1_out(T * 2 * I);
+    DeviceBuf<float> act_out(T * I);
+    DeviceBuf<float> gemm2_out(T * D);
+
+    // Per-expert sequential loop with a host-device sync on every iteration.
+    // This is the primary performance killer: 32 cudaStreamSynchronize calls.
+    for (int e = 0; e < E_local; e++) {
+        // Single-threaded gather: one thread walks all T*K assignments.
+        moe_gather(d_input, expert_indices.ptr, expert_weights.ptr, e,
+                   gathered.ptr, token_map.ptr, d_count.ptr, cfg, stream);
+        int h_count = 0;
+        CUDA_CHECK(cudaMemcpyAsync(&h_count, d_count.ptr, sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream)); // ← GPU stalls here, 32 times
+        if (h_count == 0) continue;
+
+        // FFN up-projection: C[h_count, 2*I] = gathered[h_count, D] * W1[D, 2*I]
+        // naive_gemm_kernel_impl: every output element iterates over D in DRAM.
+        // Zero shared-memory — absolute worst-case bandwidth usage.
+        {
+            int M_ = h_count, N_ = 2 * I, K_ = D;
+            dim3 block(16, 16);
+            dim3 grid((N_ + 15) / 16, (M_ + 15) / 16);
+            // W1 stored [2*I, D] row-major — pass as [D, 2*I] (B = W1^T in conceptual sense)
+            // but we call naive_gemm_kernel_impl which expects B[K_,N], so here B = W1^T
+            // We pass d_w1+e*2I*D as B with K_=D, N_=2I (conceptually transposed read).
+            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(
+                gathered.ptr, d_w1 + (size_t)e * 2 * I * D, gemm1_out.ptr, M_, N_, K_);
+        }
+        // SwiGLU reads gemm1_out from DRAM — a full extra round-trip.
+        swiglu_strided_kernel<<<(h_count * I + 255) / 256, 256, 0, stream>>>(
+            gemm1_out.ptr, act_out.ptr, h_count, I);
+        // FFN down-projection: same naive pattern.
+        {
+            int M_ = h_count, N_ = D, K_ = I;
+            dim3 block(16, 16);
+            dim3 grid((N_ + 15) / 16, (M_ + 15) / 16);
+            naive_gemm_bt_kernel<<<grid, block, 0, stream>>>(
+                act_out.ptr, d_w2 + (size_t)e * D * I, gemm2_out.ptr, M_, N_, K_);
+        }
+        // Scatter back: atomicAdd per output element, one block per routed token.
+        moe_scatter(gemm2_out.ptr, token_map.ptr, expert_weights.ptr, expert_indices.ptr,
+                    e, d_output, h_count, cfg, stream);
+    }
+}
+
 // 1. BASELINE: Naive Implementation
 void moe_forward_naive(const float* d_input, const float* d_gate_weight,
                        const float* d_w1, const float* d_w2, float* d_output,

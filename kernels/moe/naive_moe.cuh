@@ -77,6 +77,13 @@ void moe_scatter(const float* expert_out, const int* token_map,
 // MoE Forward Implementations
 // ---------------------------------------------------------------------------
 
+// 0. TRUE NAIVE: Pure per-element GEMM with zero shared-memory — the pedagogical floor.
+//    Every thread reads A-row and B-column from DRAM on every k-iteration.
+//    Gather uses a single-threaded serial loop.  32× host-sync stalls.
+void moe_forward_true_naive(const float* input, const float* gate_weight,
+                            const float* w1, const float* w2, float* output,
+                            const MoeConfig& cfg, cudaStream_t stream = 0);
+
 // 1. BASELINE: Naive kernels (gate_logits -> softmax -> topk -> naive_gemm)
 void moe_forward_naive(const float* input, const float* gate_weight,
                        const float* w1, const float* w2, float* output,

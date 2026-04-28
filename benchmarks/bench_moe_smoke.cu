@@ -1,4 +1,5 @@
 #include "../kernels/moe/naive_moe.cuh"
+
 #include <cstdio>
 #include <vector>
 #include <string>
@@ -81,6 +82,8 @@ void bench_deepseek(const char* name, const MoeConfig& cfg, int warmup, int iter
     cudaFree(d_in); cudaFree(d_gate); cudaFree(d_bias); cudaFree(d_w1); cudaFree(d_w2); cudaFree(d_out);
 }
 
+
+
 int main(int argc, char** argv) {
     int warmup = 2;
     int iters  = 5;
@@ -100,6 +103,8 @@ int main(int argc, char** argv) {
     // {num_tokens, num_experts, num_local_experts, top_k, hidden_dim, intermediate_dim, n_group, topk_group, routed_scaling_factor}
     MoeConfig ds_v3 = {512, 256, 32, 8, 7168, 2048, 8, 4, 1.0f};
 
+    if (variant == "" || variant == "TrueNaive")
+        bench_one("TrueNaive", moe_forward_true_naive, ds_v3, warmup, iters);
     if (variant == "" || variant == "Naive")
         bench_one("Naive", moe_forward_naive, ds_v3, warmup, iters);
     if (variant == "" || variant == "Opt1")
@@ -114,6 +119,7 @@ int main(int argc, char** argv) {
         bench_one("Opt5", moe_forward_opt5, ds_v3, warmup, iters);
     if (variant == "" || variant == "DeepSeek")
         bench_deepseek("DeepSeek", ds_v3, warmup, iters);
+
 
     printf("  --------------------------------------------------------------------------------\n");
     return 0;

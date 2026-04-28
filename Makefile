@@ -12,15 +12,17 @@ MOE_SRC = kernels/moe/naive_moe.cu
 TEST_MOE  = $(BUILD_DIR)/test_moe
 TEST_DEEPSEEK = $(BUILD_DIR)/test_deepseek
 BENCH_MOE = $(BUILD_DIR)/bench_moe
+BENCH_MOE_SEQLEN = $(BUILD_DIR)/bench_moe_seqlen
+TEST_FP8 = $(BUILD_DIR)/test_fp8_cuda
 SIMPLE_VADD = $(BUILD_DIR)/simple_vadd
 
-.PHONY: all tests benchmarks test bench clean debug_tests profile_vadd_nsys profile_vadd_ncu check_tools test_deepseek
+.PHONY: all tests benchmarks test bench clean debug_tests profile_vadd_nsys profile_vadd_ncu check_tools test_deepseek test_fp8 test_fp8_correctness
 
 all: tests benchmarks
 
 tests: $(TEST_MOE) $(TEST_DEEPSEEK)
 
-benchmarks: $(BENCH_MOE)
+benchmarks: $(BENCH_MOE) $(BENCH_MOE_SEQLEN)
 
 # ---------- Build rules ----------
 
@@ -35,6 +37,24 @@ $(TEST_DEEPSEEK): tests/test_moe_deepseek.cu $(MOE_SRC) | $(BUILD_DIR)
 
 $(BENCH_MOE): benchmarks/bench_moe.cu $(MOE_SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/bench_moe.cu $(MOE_SRC)
+
+$(BENCH_MOE_SEQLEN): benchmarks/bench_moe_seqlen.cu $(MOE_SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/bench_moe_seqlen.cu $(MOE_SRC)
+
+# FP8 correctness test binary
+FP8_SRC = kernels/moe/fp8_moe.cu
+$(TEST_FP8): tests/test_fp8_cuda.cu $(MOE_SRC) $(FP8_SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_fp8_cuda.cu $(MOE_SRC) $(FP8_SRC)
+
+test_fp8: $(TEST_FP8)
+	@echo "FP8 binary built: $(TEST_FP8)"
+
+test_fp8_correctness: $(TEST_FP8)
+	@echo "==============================="
+	@echo "  Running FP8 correctness test"
+	@echo "==============================="
+	pip3 install -q numpy 2>/dev/null || true
+	python3 tests/test_fp8_correctness.py /tmp/fp8_test_data
 
 bench_moe_smoke: $(MOE_SRC) | $(BUILD_DIR)
 	$(NVCC) $(NVCC_FLAGS) -lnvToolsExt -o build/bench_moe_smoke benchmarks/bench_moe_smoke.cu $(MOE_SRC)
@@ -67,6 +87,9 @@ test_moe: $(TEST_MOE)
 
 bench_moe: $(BENCH_MOE)
 	./$(BENCH_MOE)
+
+bench_moe_seqlen: $(BENCH_MOE_SEQLEN)
+	./$(BENCH_MOE_SEQLEN)
 
 check_tools:
 	@nsys --version
@@ -133,3 +156,15 @@ profile_moe_full: profile_moe_1 profile_moe_2 profile_moe_3
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+bench_moe_4096: benchmarks/bench_moe_4096.cu $(MOE_SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/bench_moe_4096.cu $(MOE_SRC)
+
+run_bench_moe_4096: bench_moe_4096
+	./bench_moe_4096
+
+bench_missing: benchmarks/bench_missing.cu $(MOE_SRC) | $(BUILD_DIR)
+	$(NVCC) $(NVCC_FLAGS) -o $@ benchmarks/bench_missing.cu $(MOE_SRC)
+
+run_bench_missing: bench_missing
+	./bench_missing
