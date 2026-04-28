@@ -76,7 +76,7 @@ build_profile_binary() {
     nvcc -std=c++17 -O2 -arch=native -lineinfo -lnvToolsExt -lcublas \
         -o "${BENCH_BIN}" \
         "${PROJECT_ROOT}/benchmarks/bench_moe.cu" \
-        "${PROJECT_ROOT}/kernels/moe/naive_moe.cu"
+        "${PROJECT_ROOT}/kernels/moe/moe_kernels.cu"
 
     echo "  ✓ Built: ${BENCH_BIN} (with -lineinfo for source correlation)"
 }

@@ -1,7 +1,7 @@
 #include <cstdio>
 #include <vector>
 #include <algorithm>
-#include "../kernels/moe/naive_moe.cuh"
+#include "../kernels/moe/moe_kernels.cuh"
 #include "../utils/cuda_utils.cuh"
 
 typedef void (*moe_fn)(const float*,const float*,const float*,const float*,float*,const MoeConfig&,cudaStream_t);

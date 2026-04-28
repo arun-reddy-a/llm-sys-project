@@ -1,4 +1,4 @@
-#include "naive_moe.cuh"
+#include "moe_kernels.cuh"
 #include "../../utils/cuda_utils.cuh"
 #include <cfloat>
 #include <cstdio>

@@ -6,7 +6,7 @@ BUILD_DIR  = build
 VARIANT   ?= Opt5
 
 # Source files
-MOE_SRC = kernels/moe/naive_moe.cu
+MOE_SRC = kernels/moe/moe_kernels.cu
 
 # Targets
 TEST_MOE  = $(BUILD_DIR)/test_moe

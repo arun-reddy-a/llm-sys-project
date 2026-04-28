@@ -4,7 +4,7 @@
 #include <cfloat>
 #include <vector>
 #include <algorithm>
-#include "../kernels/moe/naive_moe.cuh"
+#include "../kernels/moe/moe_kernels.cuh"
 #include "../utils/cuda_utils.cuh"
 
 // ===================================================================

@@ -1,4 +1,4 @@
-#include "../kernels/moe/naive_moe.cuh"
+#include "../kernels/moe/moe_kernels.cuh"
 
 #include <cstdio>
 #include <vector>
