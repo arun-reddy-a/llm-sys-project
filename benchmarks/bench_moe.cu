@@ -159,6 +159,53 @@ int main(int argc, char** argv) {
     }
     printf("  %s\n", std::string(110, '-').c_str());
 
+    // BF16 cuBLAS variant
+    printf("\n  %-12s  %-40s  %8s  %8s  %12s\n",
+           "Variant", "Config", "Min(ms)", "Mean(ms)", "Tok/s");
+    printf("  %s\n", std::string(110, '-').c_str());
+
+    for (auto& bc : configs) {
+        const MoeConfig& cfg = bc.moe;
+        int T = cfg.num_tokens, E_local = cfg.num_local_experts;
+        int D = cfg.hidden_dim, I = cfg.intermediate_dim;
+
+        DeviceBuf<__nv_bfloat16> d_input_bf16(T * D);
+        DeviceBuf<float>         d_gate(cfg.num_experts * D);
+        DeviceBuf<float>         d_bias(cfg.num_experts);
+        DeviceBuf<__nv_bfloat16> d_w1_bf16((size_t)E_local * 2 * I * D);
+        DeviceBuf<__nv_bfloat16> d_w2_bf16((size_t)E_local * D * I);
+        DeviceBuf<__nv_bfloat16> d_output_bf16(T * D);
+
+        CUDA_CHECK(cudaMemset(d_input_bf16.ptr, 0x3f, T * D * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMemset(d_w1_bf16.ptr,    0x3f, (size_t)E_local * 2 * I * D * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMemset(d_w2_bf16.ptr,    0x3f, (size_t)E_local * D * I * sizeof(__nv_bfloat16)));
+        CUDA_CHECK(cudaMemset(d_gate.ptr,        0,   cfg.num_experts * D * sizeof(float)));
+        CUDA_CHECK(cudaMemset(d_bias.ptr,        0,   cfg.num_experts * sizeof(float)));
+
+        for (int i = 0; i < warmup; i++)
+            moe_forward_deepseek_bf16_cublas(d_input_bf16.ptr, d_gate.ptr, d_bias.ptr,
+                                             d_w1_bf16.ptr, d_w2_bf16.ptr, d_output_bf16.ptr, cfg, 0);
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        std::vector<float> times(iters);
+        GpuTimer timer;
+        for (int i = 0; i < iters; i++) {
+            timer.begin();
+            moe_forward_deepseek_bf16_cublas(d_input_bf16.ptr, d_gate.ptr, d_bias.ptr,
+                                             d_w1_bf16.ptr, d_w2_bf16.ptr, d_output_bf16.ptr, cfg, 0);
+            timer.end();
+            times[i] = timer.elapsed_ms();
+        }
+        std::sort(times.begin(), times.end());
+        float t_min = times.front(), t_mean = 0.f;
+        for (float t : times) t_mean += t;
+        t_mean /= iters;
+        printf("  %-12s  %-40s  %8.3f  %8.3f  %12.0f\n",
+               "DS-BF16-CB", bc.label, t_min, t_mean, T / (t_mean * 1e-3f));
+        fflush(stdout);
+    }
+    printf("  %s\n", std::string(110, '-').c_str());
+
     printf("\n");
     return 0;
 }

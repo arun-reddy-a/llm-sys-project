@@ -4,9 +4,16 @@ Benchmark vLLM's fused_moe Triton kernel with the DeepSeek-V3 MoE config.
 E=256, D=7168, I=2048, K=8.  Runs on B200 with bfloat16 (production dtype).
 Output format matches bench_moe.cu so the local entrypoint can parse both.
 """
+import os
+import sys
 import torch
 import time
-import sys
+
+# vLLM's distributed module requires an initialized process group at import time.
+os.environ.setdefault("MASTER_ADDR", "localhost")
+os.environ.setdefault("MASTER_PORT", "29500")
+if not torch.distributed.is_initialized():
+    torch.distributed.init_process_group(backend="gloo", world_size=1, rank=0)
 
 SEQ_LENS = [64, 256, 512, 1024, 2048, 4096]
 E, D, I_DIM, K = 256, 7168, 2048, 8

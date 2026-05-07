@@ -1585,3 +1585,131 @@ void moe_forward_deepseek_bf16(
     fp32_to_bf16_out_kernel<<<(T * D + 255) / 256, 256, 0, stream>>>(
         s_output_fp32.ptr, d_output, T * D);
 }
+
+// ===================================================================
+// BF16-cuBLAS VARIANT — DeepSeek-V3 with cuBLAS BF16 Tensor Core GEMMs
+//   Same routing as moe_forward_deepseek_bf16 but replaces the hand-
+//   written WMMA kernel with cublasGemmEx (CUDA_R_16BF + COMPUTE_32F).
+//   cuBLAS autotuning picks the best algo per shape at runtime.
+// ===================================================================
+void moe_forward_deepseek_bf16_cublas(
+    const __nv_bfloat16* d_input,
+    const float*         d_gate_weight,
+    const float*         d_gate_bias,
+    const __nv_bfloat16* d_w1,
+    const __nv_bfloat16* d_w2,
+    __nv_bfloat16*       d_output,
+    const MoeConfig& cfg, cudaStream_t stream)
+{
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    static cublasHandle_t h_cb = nullptr;
+    if (!h_cb) {
+        cublasCreate(&h_cb);
+        cublasSetMathMode(h_cb, CUBLAS_DEFAULT_MATH);
+    }
+    cublasSetStream(h_cb, stream);
+
+    static DeviceBuf<int>           s_idx_cb, s_cnt_cb, s_tidx_cb, s_off_cb, s_map_cb;
+    static DeviceBuf<float>         s_wts_cb, s_ifp32, s_g1, s_afp32, s_g2, s_ofp32;
+    static DeviceBuf<__nv_bfloat16> s_gin_cb, s_abf16;
+
+    // 1. BF16→FP32 for gate
+    s_ifp32.resize(T * D);
+    bf16_to_fp32_kernel<<<(T * D + 255) / 256, 256, 0, stream>>>(d_input, s_ifp32.ptr, T * D);
+
+    // 2. Gate routing (FP32)
+    s_idx_cb.resize(T * K); s_wts_cb.resize(T * K);
+    moe_gate_deepseek(s_ifp32.ptr, d_gate_weight, d_gate_bias, s_idx_cb.ptr, s_wts_cb.ptr, cfg, stream);
+
+    // 3. Expert grouping
+    s_cnt_cb.resize(E + 1); s_cnt_cb.zero(stream);
+    s_tidx_cb.resize(T * K);
+    expert_grouping_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
+        s_idx_cb.ptr, s_cnt_cb.ptr, s_tidx_cb.ptr, T, K, E);
+
+    static std::vector<int> h_cnt_cb, h_off_cb;
+    h_cnt_cb.resize(E + 1);
+    CUDA_CHECK(cudaMemcpyAsync(h_cnt_cb.data(), s_cnt_cb.ptr, E * sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    h_off_cb.assign(E + 1, 0);
+    for (int i = 0; i < E; i++) h_off_cb[i + 1] = h_off_cb[i] + h_cnt_cb[i];
+    s_off_cb.resize(E + 1);
+    s_off_cb.upload(h_off_cb.data(), stream);
+
+    int total_active = h_off_cb[E];
+    int total_local  = h_off_cb[E_local];
+    if (total_active == 0) return;
+
+    // 4. BF16 token reorder
+    s_gin_cb.resize(total_active * D);
+    s_map_cb.resize(total_active);
+    group_reorder_kernel_bf16<<<T * K, 256, 0, stream>>>(
+        d_input, s_idx_cb.ptr, s_off_cb.ptr, s_tidx_cb.ptr,
+        s_gin_cb.ptr, s_map_cb.ptr, T, K, D);
+
+    s_ofp32.resize(T * D);
+    CUDA_CHECK(cudaMemsetAsync(s_ofp32.ptr, 0, T * D * sizeof(float), stream));
+
+    if (total_local > 0) {
+        s_g1.resize(total_local * 2 * I);
+        s_afp32.resize(total_local * I);
+        s_abf16.resize(total_local * I);
+        s_g2.resize(total_local * D);
+
+        float alpha = 1.0f, beta = 0.0f;
+
+        // 5. GEMM1 per expert: C[M,2I] = A[M,D] @ W1[e][2I,D]^T  (BF16 → FP32)
+        for (int e = 0; e < E_local; e++) {
+            int M_e = h_off_cb[e + 1] - h_off_cb[e];
+            if (M_e == 0) continue;
+            int off = h_off_cb[e];
+            cublasGemmEx(h_cb,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                2 * I, M_e, D,
+                &alpha,
+                d_w1 + (size_t)e * 2 * I * D, CUDA_R_16BF, D,
+                s_gin_cb.ptr + (size_t)off * D, CUDA_R_16BF, D,
+                &beta,
+                s_g1.ptr + (size_t)off * 2 * I, CUDA_R_32F, 2 * I,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+
+        // 6. SwiGLU (FP32)
+        swiglu_strided_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(
+            s_g1.ptr, s_afp32.ptr, total_local, I);
+
+        // 7. FP32→BF16 for GEMM2 input
+        fp32_to_bf16_kernel<<<(total_local * I + 255) / 256, 256, 0, stream>>>(
+            s_afp32.ptr, s_abf16.ptr, total_local * I);
+
+        // 8. GEMM2 per expert: C[M,D] = A[M,I] @ W2[e][D,I]^T  (BF16 → FP32)
+        for (int e = 0; e < E_local; e++) {
+            int M_e = h_off_cb[e + 1] - h_off_cb[e];
+            if (M_e == 0) continue;
+            int off = h_off_cb[e];
+            cublasGemmEx(h_cb,
+                CUBLAS_OP_T, CUBLAS_OP_N,
+                D, M_e, I,
+                &alpha,
+                d_w2 + (size_t)e * D * I, CUDA_R_16BF, I,
+                s_abf16.ptr + (size_t)off * I, CUDA_R_16BF, I,
+                &beta,
+                s_g2.ptr + (size_t)off * D, CUDA_R_32F, D,
+                CUBLAS_COMPUTE_32F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+
+        // 9. FP32 scatter (atomicAdd)
+        grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
+            s_g2.ptr, s_map_cb.ptr, s_wts_cb.ptr, s_idx_cb.ptr,
+            s_off_cb.ptr, s_ofp32.ptr, T, K, D, E_local);
+    }
+
+    // 10. FP32→BF16 output
+    fp32_to_bf16_out_kernel<<<(T * D + 255) / 256, 256, 0, stream>>>(
+        s_ofp32.ptr, d_output, T * D);
+}
