@@ -86,27 +86,25 @@ def _fp8_grouped_gemm_kernel(
         k_start = kb * BLOCK_K
         ks = k_start + tl.arange(0, BLOCK_K)
 
-        # A tile: [BLOCK_M, BLOCK_K] fp8 → bf16 for tl.dot
-        # (load in fp8 to save bandwidth, cast before MMA)
+        # A tile: [BLOCK_M, BLOCK_K] fp8
         a = tl.load(
             a_ptr + rows[:, None] * K + ks[None, :],
             mask=m_mask[:, None], other=0.0,
-        ).to(tl.bfloat16)
+        )
         # A scales: [BLOCK_M] — one per row per k-block
         a_s = tl.load(
             as_ptr + rows * K_BLOCKS + kb,
             mask=m_mask, other=0.0,
         )
 
-        # B tile: [BLOCK_N, BLOCK_K] fp8 → bf16
-        # N is always a multiple of 128 for our problem dims, no n mask needed
+        # B tile: [BLOCK_N, BLOCK_K] fp8
         b = tl.load(
             b_ptr + expert * (N * K) + cols[:, None] * K + ks[None, :],
-        ).to(tl.bfloat16)
+        )
         # B scale: scalar — one per (expert, n-block, k-block)
         b_s = tl.load(bs_ptr + expert * (N_BLOCKS * K_BLOCKS) + pid_n * K_BLOCKS + kb)
 
-        # BF16 Tensor Core dot: [BLOCK_M, BLOCK_K] @ [BLOCK_N, BLOCK_K]^T → [BLOCK_M, BLOCK_N] fp32
+        # FP8 Tensor Core dot: [BLOCK_M, BLOCK_K] @ [BLOCK_N, BLOCK_K]^T → [BLOCK_M, BLOCK_N] fp32
         dot = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
 
         # Apply block scales: a_s is per-row, b_s is scalar for this tile
@@ -157,7 +155,7 @@ def triton_fp8_grouped_gemm(
     G, N, _ = b.shape
     device = a.device
 
-    BLOCK_M = 16
+    BLOCK_M = 32
     BLOCK_N = 128
     BLOCK_K = 128
 
@@ -176,8 +174,8 @@ def triton_fp8_grouped_gemm(
         K_BLOCKS=K // BLOCK_K,
         N_BLOCKS=N // BLOCK_N,
         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        num_stages=3,    # Triton emits async double-buffering (like __pipeline_memcpy_async)
-        num_warps=4,
+        num_stages=3,
+        num_warps=8,
     )
     return c
 
