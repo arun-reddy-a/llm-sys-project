@@ -42,6 +42,19 @@ image = (
 # Persist profiling results across runs
 results_vol = modal.Volume.from_name("llm-sys-profiling-results", create_if_missing=True)
 
+# Separate image for vLLM comparison — has torch + vLLM Triton kernels but no nsight tools.
+vllm_image = (
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
+    .apt_install("git", "build-essential", "libnuma-dev")
+    .pip_install("torch", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install("vllm")
+    .add_local_dir(
+        ".",
+        remote_path="/workspace",
+        ignore=[".git", "build", "__pycache__", "*.pyc"],
+    )
+)
+
 
 def log_result(target: str, result: dict):
     """Append a structured JSON Lines entry to results.jsonl.
@@ -117,6 +130,45 @@ def run_make_target(target: str, run_id: str = "", variant: str = "") -> dict:
     }
 
 
+@app.function(
+    image=vllm_image,
+    gpu="B200:1",
+    timeout=600,
+)
+def run_vllm_bench() -> dict:
+    """Run vLLM fused_moe benchmark with DeepSeek-V3 config."""
+    import subprocess, sys
+    print("\n🚀 [modal] Running vLLM fused_moe benchmark (BF16 Triton, B200)")
+    process = subprocess.Popen(
+        ["python3", "benchmarks/bench_compare.py"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd="/workspace",
+        bufsize=1,
+    )
+    full_output = []
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        full_output.append(line)
+    process.wait()
+    return {"stdout": "".join(full_output), "returncode": process.returncode}
+
+
+def _parse_bench_line(line: str):
+    """Extract (T, min_ms, toks_per_sec) from a bench output line."""
+    try:
+        if "T=" not in line:
+            return None
+        parts = line.split()
+        T = int(parts[1].split("T=")[1].split(",")[0])
+        t_min = float(parts[-3])
+        tps   = float(parts[-1])
+        return T, t_min, tps
+    except (IndexError, ValueError):
+        return None
+
+
 @app.local_entrypoint()
 def main(target: str = "bench_moe_smoke", variant: str = "Opt5"):
     """
@@ -134,9 +186,60 @@ def main(target: str = "bench_moe_smoke", variant: str = "Opt5"):
     print("=                                                         =")
     print("===========================================================")
 
+    # ── comparison mode ────────────────────────────────────────────────────
+    if target == "compare":
+        print("\n  Running comparison: our DeepSeek-V3 kernel vs vLLM fused_moe")
+        print("  (two B200 instances in parallel)\n")
+
+        our_future  = run_make_target.spawn("bench_moe", "", "")
+        vllm_future = run_vllm_bench.spawn()
+
+        our_res  = our_future.get()
+        vllm_res = vllm_future.get()
+
+        # Parse both outputs
+        our_rows  = {}
+        vllm_rows = {}
+        for line in our_res["stdout"].splitlines():
+            if "DeepSeek-V3" in line:
+                parsed = _parse_bench_line(line)
+                if parsed:
+                    our_rows[parsed[0]] = parsed[1:]
+        for line in vllm_res["stdout"].splitlines():
+            if "vLLM" in line:
+                parsed = _parse_bench_line(line)
+                if parsed:
+                    vllm_rows[parsed[0]] = parsed[1:]
+
+        SEQ_LENS = [64, 256, 512, 1024, 2048, 4096]
+        print("\n" + "=" * 96)
+        print("  DeepSeek-V3 MoE: Ours (FP32 CUDA) vs vLLM fused_moe (BF16 Triton) — B200")
+        print("=" * 96)
+        print(f"  {'T':<6}  {'Ours min(ms)':<14} {'Ours tok/s':<14} {'vLLM min(ms)':<14} {'vLLM tok/s':<14} {'Ratio'}")
+        print("  " + "-" * 82)
+        for T in SEQ_LENS:
+            o = our_rows.get(T)
+            v = vllm_rows.get(T)
+            o_min = f"{o[0]:.3f}" if o else "—"
+            o_tps = f"{o[1]:,.0f}"  if o else "—"
+            v_min = f"{v[0]:.3f}" if v else "—"
+            v_tps = f"{v[1]:,.0f}"  if v else "—"
+            if o and v:
+                ratio = v[1] / o[1]
+                note  = "vLLM faster" if ratio > 1 else "Ours faster"
+                ratio_str = f"{ratio:.2f}× ({note})"
+            else:
+                ratio_str = "—"
+            print(f"  {T:<6}  {o_min:<14} {o_tps:<14} {v_min:<14} {v_tps:<14} {ratio_str}")
+        print("=" * 96)
+        print("  Note: FP32 vs BF16 — not perfectly apples-to-apples.")
+        print("  vLLM uses Triton autotuning; ours is handwritten CUDA.")
+        return
+
+    # ── normal mode ────────────────────────────────────────────────────────
     targets = target.split(",")
     failed = []
-    
+
     # Generate unique run ID for tracking output files
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
