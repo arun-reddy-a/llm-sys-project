@@ -52,6 +52,15 @@ def probe_env() -> str:
 @app.function(image=image, gpu="B200:1", timeout=600)
 def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) -> str:
     import subprocess
+    # First probe what deep_gemm exposes
+    probe = subprocess.run(
+        [PYTHON, "-c",
+         "import deep_gemm; print('deep_gemm version:', getattr(deep_gemm,'__version__','?')); "
+         "print('deep_gemm API:', [x for x in dir(deep_gemm) if not x.startswith('_')])"],
+        capture_output=True, text=True,
+    )
+    print("=== deep_gemm probe ===")
+    print(probe.stdout + probe.stderr)
     result = subprocess.run(
         [PYTHON, "scripts/run_local.py",
          f"--warmup={warmup}", f"--iters={iters}",
@@ -61,7 +70,7 @@ def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) 
     )
     out = result.stdout + result.stderr
     print(out)
-    return out
+    return probe.stdout + probe.stderr + "\n" + out
 
 
 @app.local_entrypoint()
