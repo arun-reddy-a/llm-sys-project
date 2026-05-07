@@ -17,8 +17,8 @@ image = (
         extra_index_url="https://flashinfer.ai/whl/cu128/torch2.7/",
     )
     .run_commands(
-        # --no-build-isolation lets DeepGEMM's setup.py see torch in the system path
-        "pip install --quiet --no-build-isolation git+https://github.com/deepseek-ai/DeepGEMM.git",
+        # wheel must be present before --no-build-isolation so setuptools can build the package
+        "pip install --quiet wheel && pip install --quiet --no-build-isolation git+https://github.com/deepseek-ai/DeepGEMM.git",
     )
     .add_local_dir(".", remote_path="/workspace",
                    ignore=[".git", "build", "__pycache__", "*.pyc"])
