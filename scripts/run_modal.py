@@ -52,23 +52,46 @@ def probe_env() -> str:
 @app.function(image=image, gpu="B200:1", timeout=600)
 def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) -> str:
     import subprocess
-    # Probe deep_gemm API
+    # Probe deep_gemm 2.5 API with a small live test
     probe = subprocess.run(
         [PYTHON, "-c", """
-import deep_gemm, inspect, io, sys
+import deep_gemm, torch, traceback
 print('deep_gemm version:', getattr(deep_gemm,'__version__','?'))
-for fn in ['m_grouped_fp8_gemm_nt_contiguous','m_grouped_fp8_gemm_nt_masked',
-           'per_block_cast_to_fp8']:
-    obj = getattr(deep_gemm, fn, None)
-    if obj is not None:
-        buf = io.StringIO()
-        sys.stdout = buf
-        help(obj)
-        sys.stdout = sys.__stdout__
-        print(f'--- {fn} ---')
-        print(buf.getvalue()[:600])
-print('--- legacy.m_grouped_gemm ---')
-help(deep_gemm.legacy.m_grouped_gemm)
+dev = 'cuda'
+# Problem dims matching competition
+M, K, N, G = 64, 7168, 4096, 32
+# Build contiguous grouped data: 2 tokens per expert, sorted
+tokens_per_expert = 2
+N_local = M
+# per-row expert IDs: 0,0,1,1,...,31,31
+exp_ids = torch.arange(G, device=dev).repeat_interleave(tokens_per_expert).to(torch.int32)
+
+x   = torch.randn(N_local, K, device=dev).to(torch.float8_e4m3fn)
+xs  = torch.ones(N_local, K//128, device=dev)   # [M, K//128]
+w   = torch.randn(G, N, K, device=dev).to(torch.float8_e4m3fn)
+ws  = torch.ones(G, N//128, K//128, device=dev) # [G, N//128, K//128]
+out = torch.zeros(N_local, N, dtype=torch.bfloat16, device=dev)
+
+fn = deep_gemm.m_grouped_fp8_gemm_nt_contiguous
+print('trying m_grouped_fp8_gemm_nt_contiguous...')
+
+# Try 1: old-style per-row m_indices
+try:
+    fn((x,xs),(w,ws),out,exp_ids); print('SUCCESS with per-row exp_ids')
+except Exception as e: print('fail1:', e)
+
+# Try 2: CSR grouped_layout [G+1] cumsum
+try:
+    # Each expert gets 2 tokens: [0,2,4,...,64]
+    gl = torch.arange(0, G+1, device=dev, dtype=torch.int32)*tokens_per_expert
+    fn((x,xs),(w,ws),out,gl); print('SUCCESS with CSR grouped_layout')
+except Exception as e: print('fail2:', e)
+
+# Try 3: m_grouped_fp8_gemm_nt_masked (per-row group IDs)
+try:
+    fn2 = deep_gemm.m_grouped_fp8_gemm_nt_masked
+    fn2((x,xs),(w,ws),out,exp_ids,N_local); print('SUCCESS masked')
+except Exception as e: print('fail3 masked:', e)
 """],
         capture_output=True, text=True,
     )
