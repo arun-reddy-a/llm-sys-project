@@ -3,22 +3,22 @@
 import modal
 import sys
 
-PYTHON = "/opt/conda/envs/py312/bin/python3"
-PIP    = f"{PYTHON} -m pip install --quiet"
+PYTHON = "python3"
 
 probe_image = modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
 
 image = (
-    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
+    # Use CUDA 12.8 dev image — has verified cu128 wheels for torch/flashinfer
+    modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
+    .apt_install("git", "build-essential", "libnuma-dev")
+    .pip_install("torch", extra_index_url="https://download.pytorch.org/whl/cu128")
+    .pip_install(
+        "flashinfer-python",
+        extra_index_url="https://flashinfer.ai/whl/cu128/torch2.7/",
+    )
     .run_commands(
-        # 1. PyTorch (must come first — deep_gemm build depends on it)
-        f"{PIP} torch==2.7.0 --index-url https://download.pytorch.org/whl/cu132",
-        # 2. FlashInfer wheel for CUDA 13.2 / Torch 2.7
-        f"{PIP} flashinfer-python --find-links https://flashinfer.ai/whl/cu132/torch2.7/",
-        # 3. DeepGEMM — build from source (needs torch in path)
-        f"{PYTHON} -m pip install --quiet git+https://github.com/deepseek-ai/DeepGEMM.git",
-        # 4. Triton (bundled with torch but pin to match)
-        f"{PIP} triton",
+        # DeepGEMM needs torch present to build its CUDA extensions
+        "pip install --quiet git+https://github.com/deepseek-ai/DeepGEMM.git",
     )
     .add_local_dir(".", remote_path="/workspace",
                    ignore=[".git", "build", "__pycache__", "*.pyc"])
