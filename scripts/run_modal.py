@@ -52,22 +52,23 @@ def probe_env() -> str:
 @app.function(image=image, gpu="B200:1", timeout=600)
 def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) -> str:
     import subprocess
-    # Probe deep_gemm API and signatures
+    # Probe deep_gemm API
     probe = subprocess.run(
         [PYTHON, "-c", """
-import deep_gemm, inspect
+import deep_gemm, inspect, io, sys
 print('deep_gemm version:', getattr(deep_gemm,'__version__','?'))
 for fn in ['m_grouped_fp8_gemm_nt_contiguous','m_grouped_fp8_gemm_nt_masked',
-           'fp8_m_grouped_gemm_nt_masked','per_block_cast_to_fp8',
-           'get_mn_major_tma_aligned_tensor','transform_sf_into_required_layout']:
+           'per_block_cast_to_fp8']:
     obj = getattr(deep_gemm, fn, None)
     if obj is not None:
-        try:
-            sig = inspect.signature(obj)
-            print(f'{fn}{sig}')
-        except Exception as e:
-            print(f'{fn}: {e}')
-print('legacy:', [x for x in dir(deep_gemm.legacy) if not x.startswith('_')])
+        buf = io.StringIO()
+        sys.stdout = buf
+        help(obj)
+        sys.stdout = sys.__stdout__
+        print(f'--- {fn} ---')
+        print(buf.getvalue()[:600])
+print('--- legacy.m_grouped_gemm ---')
+help(deep_gemm.legacy.m_grouped_gemm)
 """],
         capture_output=True, text=True,
     )
