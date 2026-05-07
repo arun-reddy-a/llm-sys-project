@@ -64,10 +64,26 @@ def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) 
     return out
 
 
+@app.function(image=image, gpu="B200:1", timeout=60)
+def probe_flashinfer() -> str:
+    import subprocess
+    r = subprocess.run(
+        [PYTHON, "-c",
+         "import inspect; from flashinfer.fused_moe import trtllm_fp8_block_scale_moe as f; "
+         "print(inspect.signature(f))"],
+        capture_output=True, text=True,
+    )
+    return r.stdout + r.stderr
+
+
 @app.local_entrypoint()
-def main(warmup: int = 3, iters: int = 30, compare_baseline: bool = False, probe: bool = False):
+def main(warmup: int = 3, iters: int = 30, compare_baseline: bool = False,
+         probe: bool = False, probe_fi: bool = False):
     if probe:
         print(probe_env.remote())
+        return
+    if probe_fi:
+        print(probe_flashinfer.remote())
         return
     result = run_bench.remote(warmup, iters, compare_baseline)
     print(result)
