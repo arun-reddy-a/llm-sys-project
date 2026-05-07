@@ -52,11 +52,23 @@ def probe_env() -> str:
 @app.function(image=image, gpu="B200:1", timeout=600)
 def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) -> str:
     import subprocess
-    # First probe what deep_gemm exposes
+    # Probe deep_gemm API and signatures
     probe = subprocess.run(
-        [PYTHON, "-c",
-         "import deep_gemm; print('deep_gemm version:', getattr(deep_gemm,'__version__','?')); "
-         "print('deep_gemm API:', [x for x in dir(deep_gemm) if not x.startswith('_')])"],
+        [PYTHON, "-c", """
+import deep_gemm, inspect
+print('deep_gemm version:', getattr(deep_gemm,'__version__','?'))
+for fn in ['m_grouped_fp8_gemm_nt_contiguous','m_grouped_fp8_gemm_nt_masked',
+           'fp8_m_grouped_gemm_nt_masked','per_block_cast_to_fp8',
+           'get_mn_major_tma_aligned_tensor','transform_sf_into_required_layout']:
+    obj = getattr(deep_gemm, fn, None)
+    if obj is not None:
+        try:
+            sig = inspect.signature(obj)
+            print(f'{fn}{sig}')
+        except Exception as e:
+            print(f'{fn}: {e}')
+print('legacy:', [x for x in dir(deep_gemm.legacy) if not x.startswith('_')])
+"""],
         capture_output=True, text=True,
     )
     print("=== deep_gemm probe ===")
