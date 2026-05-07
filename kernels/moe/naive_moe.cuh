@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 // ---------------------------------------------------------------------------
 // MoE configuration
@@ -121,3 +122,15 @@ void moe_forward_deepseek_naive(const float* input, const float* gate_weight, co
 void moe_forward(const float* input, const float* gate_weight,
                  const float* w1, const float* w2, float* output,
                  const MoeConfig& cfg, cudaStream_t stream = 0);
+
+// 9. BF16 VARIANT: BF16 weights/activations + FP32 gate routing.
+//    Grouped GEMMs use BF16 Tensor Cores (K=16 wmma) with FP32 accumulators.
+//    gate_weight and gate_bias stay FP32 (routing stays numerically stable).
+void moe_forward_deepseek_bf16(
+    const __nv_bfloat16* input,       // [T, D]
+    const float*         gate_weight, // [E, D]
+    const float*         gate_bias,   // [E]
+    const __nv_bfloat16* w1,          // [E_local, 2*I, D]
+    const __nv_bfloat16* w2,          // [E_local, D, I]
+    __nv_bfloat16*       output,      // [T, D]
+    const MoeConfig& cfg, cudaStream_t stream = 0);

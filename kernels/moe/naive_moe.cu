@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cublas_v2.h>
 #include <float.h>
 
@@ -1313,6 +1314,274 @@ void moe_forward(const float* d_input, const float* d_gate_weight,
                  const MoeConfig& cfg, cudaStream_t stream) {
     static DeviceBuf<float> s_default_bias;
     s_default_bias.resize(cfg.num_experts);
-    s_default_bias.zero(stream); 
+    s_default_bias.zero(stream);
     moe_forward_deepseek(d_input, d_gate_weight, s_default_bias.ptr, d_w1, d_w2, d_output, cfg, stream);
+}
+
+// ===================================================================
+// BF16 VARIANT — DeepSeek-V3 with BF16 weights/activations
+//   Gate routing stays FP32 (routing-critical precision).
+//   Grouped GEMMs use BF16 Tensor Cores (K=16 wmma) with FP32 accum.
+//   SMEM drops from ~40 KB to ~20 KB → higher block occupancy.
+// ===================================================================
+
+// Cast BF16 → FP32 (one element per thread)
+__global__ void bf16_to_fp32_kernel(const __nv_bfloat16* src, float* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __bfloat162float(src[i]);
+}
+
+// Cast FP32 → BF16 (one element per thread)
+__global__ void fp32_to_bf16_kernel(const float* src, __nv_bfloat16* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
+// Cast FP32 → BF16 (one element per thread)
+__global__ void fp32_to_bf16_out_kernel(const float* src, __nv_bfloat16* dst, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __float2bfloat16(src[i]);
+}
+
+// Group reorder: BF16 token copy, 128-bit vectorized (8 BF16 per float4)
+__global__ void group_reorder_kernel_bf16(
+    const __nv_bfloat16* __restrict__ input,
+    const int*           __restrict__ expert_indices,
+    const int*           __restrict__ offsets,
+    const int*           __restrict__ token_idx,
+    __nv_bfloat16*       __restrict__ grouped_out,
+    int*                 __restrict__ map,
+    int T, int K, int D)
+{
+    int tk = blockIdx.x;
+    int t = tk / K;
+    if (t >= T) return;
+    int e   = expert_indices[tk];
+    int pos = offsets[e] + token_idx[tk];
+    map[pos] = t;
+    for (int d = threadIdx.x * 8; d < D; d += blockDim.x * 8) {
+        if (d + 7 < D)
+            *((float4*)&grouped_out[pos * D + d]) = *((const float4*)&input[t * D + d]);
+        else
+            for (int dd = d; dd < D && dd < d + 8; dd++)
+                grouped_out[pos * D + dd] = input[t * D + dd];
+    }
+}
+
+// SwiGLU: BF16 gate+up in, BF16 out, FP32 intermediate
+__global__ void swiglu_strided_kernel_bf16(
+    const __nv_bfloat16* __restrict__ in,
+    __nv_bfloat16*       __restrict__ out,
+    int M, int I)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * I) return;
+    int m = idx / I, i = idx % I;
+    float gate = __bfloat162float(in[m * 2 * I + i]);
+    float up   = __bfloat162float(in[m * 2 * I + I + i]);
+    out[m * I + i] = __float2bfloat16(gate / (1.0f + expf(-gate)) * up);
+}
+
+// BF16 async double-buffered grouped GEMM
+// Tile: 64×64 output, 32 BF16 K-slice (2 × wmma K=16 per slice).
+// 256 threads × 1 float4 = 8 BF16 per thread per tile → 2048 BF16 = 64×32.
+// SMEM: As[2][64][40] + Bs[2][64][40] BF16 ≈ 20 KB (vs 41 KB for FP32).
+__global__ void grouped_gemm_blackwell_async_bf16_kernel(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ W_ptr,
+    float*               __restrict__ C,
+    const int*           __restrict__ expert_offsets,
+    const int*           __restrict__ m_tile_offsets,
+    int D, int N, int E)
+{
+    int tile_m_global = blockIdx.y;
+    int tile_n        = blockIdx.x;
+
+    int e_low = 0, e_high = E - 1, e = 0;
+    while (e_low <= e_high) {
+        int mid = (e_low + e_high) / 2;
+        if (tile_m_global >= m_tile_offsets[mid]) { e = mid; e_low = mid + 1; }
+        else e_high = mid - 1;
+    }
+
+    int tile_m_within_e   = tile_m_global - m_tile_offsets[e];
+    int global_row_base   = expert_offsets[e] + tile_m_within_e * 64;
+    int global_col_base   = tile_n * 64;
+    int expert_total_rows = expert_offsets[e + 1] - expert_offsets[e];
+    int row_within_e_base = tile_m_within_e * 64;
+    const __nv_bfloat16* W_e = W_ptr + (size_t)e * N * D;
+
+    __shared__ union {
+        struct {
+            __nv_bfloat16 As[2][64][40]; // 32 BF16 data + 8 padding → 10 KB
+            __nv_bfloat16 Bs[2][64][40]; // same
+        };
+        float Cs[64][64]; // 16 KB — fits within union (20 KB)
+    } smem;
+
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> c_frag[2];
+    nvcuda::wmma::fill_fragment(c_frag[0], 0.0f);
+    nvcuda::wmma::fill_fragment(c_frag[1], 0.0f);
+
+    int numTiles = (D + 31) / 32;
+    int tid      = threadIdx.y * blockDim.x + threadIdx.x;
+    int warp_id  = tid / 32;
+    int warp_row = warp_id / 2;
+    int warp_col = warp_id % 2;
+    // Index: 4 threads per row (each loads 1 float4 = 8 BF16), 64 rows
+    int a_r = tid / 4;
+    int a_c = (tid % 4) * 8;
+
+    // Prologue: async fetch tile 0
+    {
+        bool vA = (row_within_e_base + a_r < expert_total_rows && a_c < D);
+        if (vA) __pipeline_memcpy_async(&smem.As[0][a_r][a_c], &A[(global_row_base + a_r) * D + a_c], sizeof(float4));
+        else    *(float4*)&smem.As[0][a_r][a_c] = make_float4(0.f, 0.f, 0.f, 0.f);
+        bool vB = (global_col_base + a_r < N && a_c < D);
+        if (vB) __pipeline_memcpy_async(&smem.Bs[0][a_r][a_c], &W_e[(global_col_base + a_r) * D + a_c], sizeof(float4));
+        else    *(float4*)&smem.Bs[0][a_r][a_c] = make_float4(0.f, 0.f, 0.f, 0.f);
+        __pipeline_commit();
+    }
+
+    for (int t = 0; t < numTiles; t++) {
+        int curr_buf = t & 1, next_buf = (t + 1) & 1;
+
+        if (t + 1 < numTiles) {
+            int koff = (t + 1) * 32;
+            bool vA = (row_within_e_base + a_r < expert_total_rows && koff + a_c < D);
+            if (vA) __pipeline_memcpy_async(&smem.As[next_buf][a_r][a_c], &A[(global_row_base + a_r) * D + koff + a_c], sizeof(float4));
+            else    *(float4*)&smem.As[next_buf][a_r][a_c] = make_float4(0.f, 0.f, 0.f, 0.f);
+            bool vB = (global_col_base + a_r < N && koff + a_c < D);
+            if (vB) __pipeline_memcpy_async(&smem.Bs[next_buf][a_r][a_c], &W_e[(global_col_base + a_r) * D + koff + a_c], sizeof(float4));
+            else    *(float4*)&smem.Bs[next_buf][a_r][a_c] = make_float4(0.f, 0.f, 0.f, 0.f);
+            __pipeline_commit();
+        }
+
+        __pipeline_wait_prior(0);
+        __syncthreads();
+
+        // 2 × wmma K=16 to cover the 32-wide K-slice
+        for (int k_idx = 0; k_idx < 32; k_idx += 16) {
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,
+                __nv_bfloat16, nvcuda::wmma::row_major> a_frag;
+            nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16,
+                __nv_bfloat16, nvcuda::wmma::col_major> b_frag0, b_frag1;
+
+            nvcuda::wmma::load_matrix_sync(a_frag,  &smem.As[curr_buf][warp_row * 16][k_idx], 40);
+            nvcuda::wmma::load_matrix_sync(b_frag0, &smem.Bs[curr_buf][warp_col * 32 +  0][k_idx], 40);
+            nvcuda::wmma::load_matrix_sync(b_frag1, &smem.Bs[curr_buf][warp_col * 32 + 16][k_idx], 40);
+            nvcuda::wmma::mma_sync(c_frag[0], a_frag, b_frag0, c_frag[0]);
+            nvcuda::wmma::mma_sync(c_frag[1], a_frag, b_frag1, c_frag[1]);
+        }
+        __syncthreads();
+    }
+
+    nvcuda::wmma::store_matrix_sync(&smem.Cs[warp_row * 16][warp_col * 32 +  0], c_frag[0], 64, nvcuda::wmma::mem_row_major);
+    nvcuda::wmma::store_matrix_sync(&smem.Cs[warp_row * 16][warp_col * 32 + 16], c_frag[1], 64, nvcuda::wmma::mem_row_major);
+    __syncthreads();
+
+    for (int i = 0; i < 16; i++) {
+        int idx  = tid * 16 + i;
+        int crow = idx / 64, ccol = idx % 64;
+        if (row_within_e_base + crow < expert_total_rows && global_col_base + ccol < N)
+            C[(global_row_base + crow) * N + global_col_base + ccol] = smem.Cs[crow][ccol];
+    }
+}
+
+void moe_forward_deepseek_bf16(
+    const __nv_bfloat16* d_input,
+    const float*         d_gate_weight,
+    const float*         d_gate_bias,
+    const __nv_bfloat16* d_w1,
+    const __nv_bfloat16* d_w2,
+    __nv_bfloat16*       d_output,
+    const MoeConfig& cfg, cudaStream_t stream)
+{
+    int T = cfg.num_tokens, E = cfg.num_experts, E_local = cfg.num_local_experts;
+    int D = cfg.hidden_dim, I = cfg.intermediate_dim, K = cfg.top_k;
+
+    static DeviceBuf<int>           s_indices, s_counts, s_token_idx, s_offsets, s_tile_offsets, s_map;
+    static DeviceBuf<float>         s_weights, s_input_fp32, s_gemm1, s_gemm2, s_output_fp32;
+    static DeviceBuf<__nv_bfloat16> s_grouped_in, s_gemm1_bf16, s_act;
+
+    // 1. Gate (FP32): convert input BF16→FP32, run cuBLAS gate + selection
+    s_input_fp32.resize(T * D);
+    bf16_to_fp32_kernel<<<(T * D + 255) / 256, 256, 0, stream>>>(d_input, s_input_fp32.ptr, T * D);
+
+    s_indices.resize(T * K); s_weights.resize(T * K);
+    moe_gate_deepseek(s_input_fp32.ptr, d_gate_weight, d_gate_bias,
+                      s_indices.ptr, s_weights.ptr, cfg, stream);
+
+    // 2. Expert grouping
+    s_counts.resize(E + 1); s_counts.zero(stream);
+    s_token_idx.resize(T * K);
+    expert_grouping_kernel<<<(T * K + 255) / 256, 256, 0, stream>>>(
+        s_indices.ptr, s_counts.ptr, s_token_idx.ptr, T, K, E);
+
+    static std::vector<int> h_counts_bf16, h_offsets_bf16, h_tiles_bf16;
+    h_counts_bf16.resize(E + 1);
+    CUDA_CHECK(cudaMemcpyAsync(h_counts_bf16.data(), s_counts.ptr, E * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    h_offsets_bf16.assign(E + 1, 0); h_tiles_bf16.assign(E_local + 1, 0);
+    for (int i = 0; i < E; i++) {
+        h_offsets_bf16[i + 1] = h_offsets_bf16[i] + h_counts_bf16[i];
+        if (i < E_local)
+            h_tiles_bf16[i + 1] = h_tiles_bf16[i] + (h_counts_bf16[i] + 63) / 64;
+    }
+    s_offsets.resize(E + 1);          s_offsets.upload(h_offsets_bf16.data(), stream);
+    s_tile_offsets.resize(E_local + 1); s_tile_offsets.upload(h_tiles_bf16.data(), stream);
+
+    int total_active = h_offsets_bf16[E];
+    int total_local  = h_offsets_bf16[E_local];
+    if (total_active == 0) return;
+
+    // 3. Token reorder (BF16)
+    s_grouped_in.resize(total_active * D);
+    s_map.resize(total_active);
+    group_reorder_kernel_bf16<<<T * K, 256, 0, stream>>>(
+        d_input, s_indices.ptr, s_offsets.ptr, s_token_idx.ptr,
+        s_grouped_in.ptr, s_map.ptr, T, K, D);
+
+    // FP32 output for scatter (atomicAdd requires FP32)
+    s_output_fp32.resize(T * D);
+    CUDA_CHECK(cudaMemsetAsync(s_output_fp32.ptr, 0, T * D * sizeof(float), stream));
+
+    if (total_local > 0) {
+        s_gemm1.resize(total_local * 2 * I);
+        s_gemm1_bf16.resize(total_local * 2 * I);
+        s_act.resize(total_local * I);
+        s_gemm2.resize(total_local * D);
+
+        int total_m_tiles = h_tiles_bf16[E_local];
+
+        // GEMM 1: BF16 in × BF16 W1 → FP32 accum
+        grouped_gemm_blackwell_async_bf16_kernel<<<
+            dim3((2 * I + 63) / 64, total_m_tiles), dim3(16, 16), 0, stream>>>(
+            s_grouped_in.ptr, d_w1, s_gemm1.ptr,
+            s_offsets.ptr, s_tile_offsets.ptr, D, 2 * I, E_local);
+
+        // FP32 → BF16 for SwiGLU
+        fp32_to_bf16_kernel<<<(total_local * 2 * I + 255) / 256, 256, 0, stream>>>(
+            s_gemm1.ptr, s_gemm1_bf16.ptr, total_local * 2 * I);
+
+        swiglu_strided_kernel_bf16<<<(total_local * I + 255) / 256, 256, 0, stream>>>(
+            s_gemm1_bf16.ptr, s_act.ptr, total_local, I);
+
+        // GEMM 2: BF16 act × BF16 W2 → FP32 accum
+        grouped_gemm_blackwell_async_bf16_kernel<<<
+            dim3((D + 63) / 64, total_m_tiles), dim3(16, 16), 0, stream>>>(
+            s_act.ptr, d_w2, s_gemm2.ptr,
+            s_offsets.ptr, s_tile_offsets.ptr, I, D, E_local);
+
+        // Scatter into FP32 output (atomicAdd safe)
+        grouped_scatter_kernel<<<total_local, min(D, 1024), 0, stream>>>(
+            s_gemm2.ptr, s_map.ptr, s_weights.ptr, s_indices.ptr,
+            s_offsets.ptr, s_output_fp32.ptr, T, K, D, E_local);
+    }
+
+    // FP32 → BF16 output conversion
+    fp32_to_bf16_out_kernel<<<(T * D + 255) / 256, 256, 0, stream>>>(
+        s_output_fp32.ptr, d_output, T * D);
 }
