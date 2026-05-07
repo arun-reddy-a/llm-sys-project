@@ -86,29 +86,30 @@ def _fp8_grouped_gemm_kernel(
         k_start = kb * BLOCK_K
         ks = k_start + tl.arange(0, BLOCK_K)
 
-        # A tile: [BLOCK_M, BLOCK_K] fp8
+        # A tile: [BLOCK_M, BLOCK_K] fp8 → bf16 for tl.dot
+        # (load in fp8 to save bandwidth, cast before MMA)
         a = tl.load(
             a_ptr + rows[:, None] * K + ks[None, :],
-            mask=m_mask[:, None], other=0,
-        )
+            mask=m_mask[:, None], other=0.0,
+        ).to(tl.bfloat16)
         # A scales: [BLOCK_M] — one per row per k-block
         a_s = tl.load(
             as_ptr + rows * K_BLOCKS + kb,
             mask=m_mask, other=0.0,
         )
 
-        # B tile: [BLOCK_N, BLOCK_K] fp8 — weights for this expert
+        # B tile: [BLOCK_N, BLOCK_K] fp8 → bf16
         # N is always a multiple of 128 for our problem dims, no n mask needed
         b = tl.load(
             b_ptr + expert * (N * K) + cols[:, None] * K + ks[None, :],
-        )
+        ).to(tl.bfloat16)
         # B scale: scalar — one per (expert, n-block, k-block)
         b_s = tl.load(bs_ptr + expert * (N_BLOCKS * K_BLOCKS) + pid_n * K_BLOCKS + kb)
 
-        # FP8 Tensor Core dot: [BLOCK_M, BLOCK_K] @ [BLOCK_N, BLOCK_K]^T → [BLOCK_M, BLOCK_N]
+        # BF16 Tensor Core dot: [BLOCK_M, BLOCK_K] @ [BLOCK_N, BLOCK_K]^T → [BLOCK_M, BLOCK_N] fp32
         dot = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
 
-        # Apply block scales: a_s is per-row, b_s is a scalar for this tile
+        # Apply block scales: a_s is per-row, b_s is scalar for this tile
         acc = acc + a_s[:, None] * b_s * dot
 
     tl.store(
