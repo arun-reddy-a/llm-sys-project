@@ -20,17 +20,21 @@ app = modal.App("flashinfer-moe-competition")
 
 @app.function(image=probe_image, gpu="B200:1", timeout=120)
 def probe_env() -> str:
-    import subprocess, sys
+    import subprocess
     cmds = [
-        "python3 -c 'import deep_gemm; print(deep_gemm.__file__)' 2>&1",
-        "find /usr /opt /root -name 'deep_gemm*' 2>/dev/null | head -10",
-        "pip list 2>/dev/null | grep -iE 'deep|gemm|flash'",
-        "python3 -c 'import flashinfer; print(dir(flashinfer.fused_moe))' 2>&1",
+        "find /opt /usr /root -name 'python3*' -type f 2>/dev/null | head -10",
+        "find /opt /usr /root -name 'deep_gemm*' 2>/dev/null | head -10",
+        "find /opt /usr /root -path '*/site-packages/flashinfer*' -maxdepth 8 2>/dev/null | head -5",
+        "conda run -n py312 python3 -c 'import flashinfer, deep_gemm; print(flashinfer.__file__, deep_gemm.__file__)' 2>&1 || true",
+        "conda run -n base  python3 -c 'import flashinfer; print(flashinfer.__file__)' 2>&1 || true",
+        # Try all pythons in /opt/conda
+        "for py in /opt/conda/envs/*/bin/python3 /opt/conda/bin/python3; do echo \"==$py==\"; $py -c 'import flashinfer; print(flashinfer.__file__)' 2>&1 || true; done",
+        "ls /opt/conda/envs/ 2>/dev/null",
     ]
     out = []
     for c in cmds:
-        r = subprocess.run(c, shell=True, capture_output=True, text=True)
-        out.append(f"$ {c}\n{r.stdout}{r.stderr}")
+        r = subprocess.run(c, shell=True, capture_output=True, text=True, executable="/bin/bash")
+        out.append(f"$ {c}\n{r.stdout}{r.stderr}\n")
     result = "\n".join(out)
     print(result)
     return result
