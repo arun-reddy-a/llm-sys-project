@@ -52,7 +52,7 @@ def probe_env() -> str:
 @app.function(image=image, gpu="B200:1", timeout=600)
 def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) -> str:
     import subprocess
-result = subprocess.run(
+    result = subprocess.run(
         [PYTHON, "scripts/run_local.py",
          f"--warmup={warmup}", f"--iters={iters}",
          *(["--compare-baseline"] if compare_baseline else [])],
