@@ -3,13 +3,22 @@
 import modal
 import sys
 
+PYTHON = "/opt/conda/envs/py312/bin/python3"
+PIP    = f"{PYTHON} -m pip install --quiet"
+
 probe_image = modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
 
 image = (
     modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
     .run_commands(
-        # deep_gemm is listed in EVALUATION.md but may need to be built from source
-        "pip show deep-gemm 2>/dev/null || pip install --quiet git+https://github.com/deepseek-ai/DeepGEMM.git || true",
+        # 1. PyTorch (must come first — deep_gemm build depends on it)
+        f"{PIP} torch==2.7.0 --index-url https://download.pytorch.org/whl/cu132",
+        # 2. FlashInfer wheel for CUDA 13.2 / Torch 2.7
+        f"{PIP} flashinfer-python --find-links https://flashinfer.ai/whl/cu132/torch2.7/",
+        # 3. DeepGEMM — build from source (needs torch in path)
+        f"{PYTHON} -m pip install --quiet git+https://github.com/deepseek-ai/DeepGEMM.git",
+        # 4. Triton (bundled with torch but pin to match)
+        f"{PIP} triton",
     )
     .add_local_dir(".", remote_path="/workspace",
                    ignore=[".git", "build", "__pycache__", "*.pyc"])
@@ -41,10 +50,10 @@ def probe_env() -> str:
 
 
 @app.function(image=image, gpu="B200:1", timeout=600)
-def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = True) -> str:
-    import subprocess, sys
+def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) -> str:
+    import subprocess
     result = subprocess.run(
-        [sys.executable, "scripts/run_local.py",
+        [PYTHON, "scripts/run_local.py",
          f"--warmup={warmup}", f"--iters={iters}",
          *(["--compare-baseline"] if compare_baseline else [])],
         cwd="/workspace",
