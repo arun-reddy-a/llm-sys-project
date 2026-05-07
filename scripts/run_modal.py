@@ -17,8 +17,8 @@ image = (
         extra_index_url="https://flashinfer.ai/whl/cu128/torch2.7/",
     )
     .run_commands(
-        # DeepGEMM needs torch present to build its CUDA extensions
-        "pip install --quiet git+https://github.com/deepseek-ai/DeepGEMM.git",
+        # --no-build-isolation lets DeepGEMM's setup.py see torch in the system path
+        "pip install --quiet --no-build-isolation git+https://github.com/deepseek-ai/DeepGEMM.git",
     )
     .add_local_dir(".", remote_path="/workspace",
                    ignore=[".git", "build", "__pycache__", "*.pyc"])
