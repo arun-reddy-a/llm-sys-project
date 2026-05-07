@@ -28,17 +28,15 @@ TOPK_GROUP      = 4
 BLOCK_SIZE      = 128
 ROUTED_SCALE    = 2.5        # DeepSeek-V3 default
 
-# Sequence lengths: small, non-pow-2, large — mirrors competition workload variety
+# Primary focus: medium → large sequence lengths where GEMM dominates.
+# Small T (<64) left for later — Python overhead swamps the kernel there.
 SEQ_LENS = [
-    1, 2, 3, 4, 7, 8,
-    13, 16, 17, 32, 33,
-    63, 64, 65,
-    127, 128, 129,
-    255, 256, 257,
-    511, 512, 513,
-    1023, 1024, 1025,
-    2047, 2048, 2049,
-    4095, 4096,
+    # Medium (routing overhead manageable)
+    52, 54, 56, 58, 59, 62, 80,
+    128, 256, 512,
+    # Large (GEMM-bound — where deep_gemm should shine)
+    901, 1024, 2048, 4096,
+    8192, 11948, 14107,
 ]
 
 
