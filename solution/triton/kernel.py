@@ -93,6 +93,15 @@ def _scatter_kernel(
 
 
 # ── Core implementation (compiled) ────────────────────────────────────────────
+def _get_grouped_gemm_fn():
+    """Return the available deep_gemm grouped FP8 GEMM function (handles API rename between versions)."""
+    import deep_gemm
+    return (
+        getattr(deep_gemm, 'm_grouped_gemm_fp8_fp8_bf16_nt',    None) or  # deep_gemm <2.5 (competition env)
+        getattr(deep_gemm, 'm_grouped_fp8_gemm_nt_contiguous',  None)     # deep_gemm >=2.5
+    )
+
+
 def _moe_forward_inner(
     routing_logits,   # [T, 256] fp32
     hidden_states,    # [T, 7168] fp8_e4m3fn
@@ -105,7 +114,7 @@ def _moe_forward_inner(
     routed_scaling_factor: float,
     output,           # [T, 7168] bf16 (pre-allocated)
 ):
-    import deep_gemm
+    grouped_gemm = _get_grouped_gemm_fn()
 
     T      = routing_logits.shape[0]
     device = routing_logits.device
@@ -143,7 +152,7 @@ def _moe_forward_inner(
 
     # ── 4. GEMM1: [N_local, 7168] × [32, 4096, 7168]^T → [N_local, 4096] bf16
     g1_out = torch.empty(N_local, GEMM1_OUT, dtype=torch.bfloat16, device=device)
-    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt(
+    grouped_gemm(
         (g_hs, g_hs_sc),
         (gemm1_weights, gemm1_weights_scale),
         g1_out, exp_ids,
@@ -158,7 +167,7 @@ def _moe_forward_inner(
 
     # ── 7. GEMM2: [N_local, 2048] × [32, 7168, 2048]^T → [N_local, 7168] bf16
     g2_out = torch.empty(N_local, HIDDEN, dtype=torch.bfloat16, device=device)
-    deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt(
+    grouped_gemm(
         (act_fp8, act_sc),
         (gemm2_weights, gemm2_weights_scale),
         g2_out, exp_ids,
