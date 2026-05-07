@@ -89,14 +89,19 @@ def bench_one(T: int, warmup: int, iters: int, compare_baseline: bool):
         try:
             from flashinfer.fused_moe import trtllm_fp8_block_scale_moe as bl_fn
             rl, w1, w1s, w2, w2s, lo, rsf, out = pos_args
-            rb = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device=rl.device)
+            # New flashinfer API (2026+): explicit problem shape args, no routing_bias, no out
+            _bl_call = lambda: bl_fn(
+                rl, None, hs, hss, w1, w1s, w2, w2s,
+                NUM_EXPERTS, TOP_K, N_GROUP, TOPK_GROUP, INTERMEDIATE,
+                int(lo), NUM_LOCAL_EXP, float(rsf),
+            )
             bl_times = []
             for _ in range(warmup):
-                bl_fn(rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out)
+                _bl_call()
             torch.cuda.synchronize()
             for _ in range(iters):
                 t0 = time.perf_counter()
-                bl_fn(rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out)
+                _bl_call()
                 torch.cuda.synchronize()
                 bl_times.append((time.perf_counter() - t0) * 1e3)
             bl_times.sort()
