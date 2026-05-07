@@ -10,7 +10,7 @@ probe_image = modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401
 image = (
     # Use CUDA 12.8 dev image — has verified cu128 wheels for torch/flashinfer
     modal.Image.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.12")
-    .apt_install("git", "build-essential", "libnuma-dev")
+    .apt_install("git", "build-essential", "clang", "libnuma-dev")
     .pip_install("torch", extra_index_url="https://download.pytorch.org/whl/cu128")
     .pip_install(
         "flashinfer-python",
