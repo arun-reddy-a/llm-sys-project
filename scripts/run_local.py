@@ -43,64 +43,62 @@ SEQ_LENS = [
 
 
 def make_inputs(T: int, device="cuda"):
-    """Create random FP8 + scale tensors matching the competition API."""
+    """Create random FP8 + scale tensors matching the competition API (7-tensor variant)."""
     H, I, G1 = HIDDEN, INTERMEDIATE, GEMM1_OUT
-    E, EL   = NUM_EXPERTS, NUM_LOCAL_EXP
-    BS      = BLOCK_SIZE
+    E, EL, BS = NUM_EXPERTS, NUM_LOCAL_EXP, BLOCK_SIZE
 
-    routing_logits      = torch.randn(T, E, dtype=torch.float32, device=device)
-    routing_bias        = torch.randn(E,    dtype=torch.float32, device=device) * 0.01
-
-    hidden_states       = torch.randn(T, H, dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
-    hidden_states_scale = torch.ones(H // BS, T, dtype=torch.float32, device=device)  # [56, T]
-
+    routing_logits      = torch.randn(T, E,  dtype=torch.float32, device=device)
     gemm1_weights       = torch.randn(EL, G1, H, dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
     gemm1_weights_scale = torch.ones(EL, G1 // BS, H // BS, dtype=torch.float32, device=device)
-
-    gemm2_weights       = torch.randn(EL, H, I, dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
+    gemm2_weights       = torch.randn(EL, H, I,  dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
     gemm2_weights_scale = torch.ones(EL, H // BS, I // BS, dtype=torch.float32, device=device)
-
     output              = torch.zeros(T, H, dtype=torch.bfloat16, device=device)
 
-    return (routing_logits, routing_bias,
-            hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_weights_scale,
-            gemm2_weights, gemm2_weights_scale,
-            LOCAL_OFFSET, ROUTED_SCALE,
-            output)
+    # hidden_states passed as kwargs (may or may not be in competition API)
+    hidden_states       = torch.randn(T, H, dtype=torch.float32, device=device).to(torch.float8_e4m3fn)
+    hidden_states_scale = torch.ones(H // BS, T, dtype=torch.float32, device=device)
+
+    return dict(
+        positional=(routing_logits, gemm1_weights, gemm1_weights_scale,
+                    gemm2_weights, gemm2_weights_scale,
+                    LOCAL_OFFSET, ROUTED_SCALE, output),
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+    )
 
 
 def bench_one(T: int, warmup: int, iters: int, compare_baseline: bool):
-    inputs = make_inputs(T)
+    inp = make_inputs(T)
+    pos_args = inp["positional"]
+    hs, hss  = inp["hidden_states"], inp["hidden_states_scale"]
 
-    # Warmup
     for _ in range(warmup):
-        our_kernel(*inputs)
+        our_kernel(*pos_args, hidden_states=hs, hidden_states_scale=hss)
     torch.cuda.synchronize()
 
-    # Benchmark ours
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        our_kernel(*inputs)
+        our_kernel(*pos_args, hidden_states=hs, hidden_states_scale=hss)
         torch.cuda.synchronize()
         times.append((time.perf_counter() - t0) * 1e3)
     times.sort()
-    t_our = sum(times) / len(times)
+    t_our   = sum(times) / len(times)
     tps_our = T / (t_our * 1e-3)
 
     baseline_str = ""
     if compare_baseline:
         try:
-            from flashinfer.fused_moe import trtllm_fp8_block_scale_moe as baseline_fn
-            (rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out) = inputs
+            from flashinfer.fused_moe import trtllm_fp8_block_scale_moe as bl_fn
+            rl, w1, w1s, w2, w2s, lo, rsf, out = pos_args
+            rb = torch.zeros(NUM_EXPERTS, dtype=torch.float32, device=rl.device)
             bl_times = []
             for _ in range(warmup):
-                baseline_fn(rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out)
+                bl_fn(rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out)
             torch.cuda.synchronize()
             for _ in range(iters):
                 t0 = time.perf_counter()
-                baseline_fn(rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out)
+                bl_fn(rl, rb, hs, hss, w1, w1s, w2, w2s, lo, rsf, out)
                 torch.cuda.synchronize()
                 bl_times.append((time.perf_counter() - t0) * 1e3)
             bl_times.sort()
@@ -108,7 +106,7 @@ def bench_one(T: int, warmup: int, iters: int, compare_baseline: bool):
             speedup = t_bl / t_our
             baseline_str = f"  baseline={t_bl:7.3f}ms  speedup={speedup:.2f}x"
         except Exception as e:
-            baseline_str = f"  [baseline unavailable: {e}]"
+            baseline_str = f"  [baseline N/A: {e}]"
 
     print(f"  T={T:<6}  mean={t_our:7.3f}ms  tok/s={tps_our:>12,.0f}{baseline_str}")
 
