@@ -62,11 +62,27 @@ def run_bench(warmup: int = 3, iters: int = 30, compare_baseline: bool = False) 
     return out
 
 
+@app.function(image=image, gpu="B200:1", timeout=300)
+def run_correctness() -> str:
+    import subprocess
+    result = subprocess.run(
+        [PYTHON, "scripts/check_correctness.py"],
+        cwd="/workspace",
+        capture_output=True, text=True,
+    )
+    out = result.stdout + result.stderr
+    print(out)
+    return out
+
+
 @app.local_entrypoint()
 def main(warmup: int = 3, iters: int = 30, compare_baseline: bool = False,
-         probe_tri: bool = False):
+         probe_tri: bool = False, check_correctness: bool = False):
     if probe_tri:
         print(probe_triton.remote())
+        return
+    if check_correctness:
+        print(run_correctness.remote())
         return
     result = run_bench.remote(warmup, iters, compare_baseline)
     print(result)
