@@ -90,24 +90,22 @@ Max absolute error < 3e-4 across all tested sequence lengths. (max_rel is large 
 
 ## Performance (B200, CUDA 12.8.1)
 
-Benchmarked with `scripts/run_local.py --warmup 5 --iters 30` via Modal:
+Three-way comparison: FlashInfer TRT-LLM baseline, DeepGEMM FP8, and our custom Triton FP8 kernel.
 
-| T | mean (ms) | tok/s |
-|---|-----------|-------|
-| 52 | 0.823 | 63K |
-| 80 | 0.926 | 86K |
-| 128 | 0.916 | 140K |
-| 256 | 0.935 | 274K |
-| 512 | 1.015 | 504K |
-| 901 | 1.092 | 825K |
-| 1024 | 1.165 | 879K |
-| 2048 | 1.544 | 1.33M |
-| 4096 | 2.287 | 1.79M |
-| 8192 | 3.869 | 2.12M |
-| 11948 | 5.198 | 2.30M |
-| 14107 | 5.969 | 2.36M |
+| T | FlashInfer baseline | deep_gemm FP8 | Our Triton FP8 | vs baseline | vs deep_gemm |
+|---|---------------------|---------------|----------------|-------------|--------------|
+| 52 | 0.179 ms | 0.347 ms | 0.864 ms | 0.21x | 0.40x |
+| 56 | 0.240 ms | 0.340 ms | 1.013 ms | 0.24x | 0.34x |
+| 80 | 0.269 ms | 0.343 ms | 1.023 ms | 0.26x | 0.34x |
+| 901 | 0.699 ms | 0.450 ms | 1.180 ms | 0.59x | 0.38x |
+| 2048 | — | 0.576 ms | 1.504 ms | — | 0.38x |
+| 4096 | — | 0.880 ms | 2.223 ms | — | 0.40x |
+| 11948 | 4.985 ms | 1.564 ms | 5.377 ms | 0.93x | 0.29x |
+| 14107 | 6.359 ms | 1.746 ms | **5.909 ms** | **1.08x** | 0.30x |
 
-At small T (< 128), runtime is dominated by Python/routing overhead (~0.9ms floor), not GEMM. At large T (≥ 2048) throughput scales efficiently as the kernel becomes GEMM-bound on the B200's FP8 Tensor Cores.
+At small T (< 128), all three kernels are bottlenecked by Python/routing/launch overhead — not GEMM. The FlashInfer baseline is fastest here because it has a highly optimized CUDA routing kernel. Our Triton kernel pays ~0.9ms of fixed Python overhead, making it 4–5x slower at small T.
+
+At large T, GEMM dominates and our kernel pulls within range of the FlashInfer baseline (1.08x at T=14107). deep_gemm is consistently 2.5–3.4x faster than our Triton kernel across all sizes — it uses persistent WGMMA + TMA Blackwell kernels that cannot currently be reproduced in Triton.
 
 ## Why not torch.compile?
 
