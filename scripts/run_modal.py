@@ -75,14 +75,34 @@ def run_correctness() -> str:
     return out
 
 
+@app.function(image=image, gpu="B200:1", timeout=600)
+def run_bench_all(warmup: int = 3, iters: int = 20, seq_lens: str = "") -> str:
+    """Build CUDA kernels + run all Python variants, print unified comparison table."""
+    import subprocess
+    # Install cublas dev headers if not present (base devel image usually has them)
+    subprocess.run(["apt-get", "install", "-y", "-q", "libcublas-dev-12-8"],
+                   capture_output=True)
+    cmd = [PYTHON, "scripts/bench_all.py", f"--warmup={warmup}", f"--iters={iters}"]
+    if seq_lens:
+        cmd += [f"--seq-lens={seq_lens}"]
+    result = subprocess.run(cmd, cwd="/workspace", capture_output=True, text=True)
+    out = result.stdout + result.stderr
+    print(out)
+    return out
+
+
 @app.local_entrypoint()
 def main(warmup: int = 3, iters: int = 30, compare_baseline: bool = False,
-         probe_tri: bool = False, check_correctness: bool = False):
+         probe_tri: bool = False, check_correctness: bool = False,
+         bench_all: bool = False, seq_lens: str = ""):
     if probe_tri:
         print(probe_triton.remote())
         return
     if check_correctness:
         print(run_correctness.remote())
+        return
+    if bench_all:
+        print(run_bench_all.remote(warmup, iters, seq_lens))
         return
     result = run_bench.remote(warmup, iters, compare_baseline)
     print(result)
