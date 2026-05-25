@@ -7,3 +7,6 @@ profiling/local_results/
 *.csv
 results.jsonl
 third_party/*
+__pycache__/
+*.log
+.codex
