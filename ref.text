@@ -1,0 +1,80 @@
+===============================
+  Running MoE tests
+===============================
+./build/test_moe
+=== MoE Correctness Tests ===
+
+  small  (T=4, E=4, D=64)         max_err=3.725290e-09  mean_err=8.707843e-10  PASS
+  medium (T=32, E=8, D=128)       max_err=2.235174e-08  mean_err=3.251944e-09  PASS
+  large  (T=64, E=8, D=256)       max_err=8.195639e-08  mean_err=1.214711e-08  PASS
+  topk4  (T=16, E=8, K=4)         max_err=1.862645e-08  mean_err=2.525951e-09  PASS
+  single-token (T=1, E=4)         max_err=1.862645e-09  mean_err=7.348717e-10  PASS
+  single-expert (T=8, E=1, K=1)   max_err=4.656613e-09  mean_err=1.087475e-09  PASS
+  topk1  (T=32, E=16, K=1)        max_err=2.607703e-08  mean_err=4.084523e-09  PASS
+  wide-ffn (T=16, D=64, I=512)    max_err=1.210719e-08  mean_err=2.365972e-09  PASS
+  narrow-ffn (T=16, D=256, I=64)  max_err=2.235174e-08  mean_err=3.396839e-09  PASS
+  sparse-routing (T=4, E=16)      max_err=1.490116e-08  mean_err=3.362686e-09  PASS
+  many-tokens (T=128, E=8)        max_err=2.700835e-08  mean_err=3.331322e-09  PASS
+  full-routing (T=8, E=4, K=4)    max_err=3.725290e-09  mean_err=6.753424e-10  PASS
+  stress (T=64, E=16, D=512)      max_err=3.576279e-07  mean_err=4.647553e-08  PASS
+
+Results: 13 / 13 passed
+
+===============================
+  Running DSA tests
+===============================
+./build/test_dsa
+=== DSA Correctness Tests ===
+
+  tiny   (Q=2,H=2,Dc=32,S=16)               max=2.980232e-08  mean=3.940841e-09  PASS
+  small  (Q=4,H=4,Dc=64,S=64)               max=1.490116e-08  mean=2.495224e-09  PASS
+  medium (Q=8,H=8,Dc=128,S=128)             max=1.862645e-08  mean=2.239741e-09  PASS
+  large  (Q=4,H=4,Dc=128,S=256)             max=1.117587e-08  mean=1.663651e-09  PASS
+  single-query (Q=1,H=4,S=32)               max=2.235174e-08  mean=3.503033e-09  PASS
+  single-head (Q=4,H=1,S=64)                max=1.490116e-08  mean=2.388049e-09  PASS
+  minimal-S (Q=4,H=4,S=4)                   max=2.980232e-08  mean=4.449102e-09  PASS
+  pos-heavy (Dc=32,Dp=64,S=64)              max=1.210719e-08  mean=2.454648e-09  PASS
+  tiny-Dp (Dc=128,Dp=4,S=64)                max=1.490116e-08  mean=2.418671e-09  PASS
+  many-heads (Q=4,H=32,S=64)                max=1.862645e-08  mean=2.585069e-09  PASS
+  many-queries (Q=32,H=4,S=64)              max=2.235174e-08  mean=2.456018e-09  PASS
+  full-cache (Q=4,S=N=128)                  max=2.048910e-08  mean=2.210548e-09  PASS
+  large-cache (N=4096,S=128)                max=2.048910e-08  mean=2.224649e-09  PASS
+  stress (Q=16,H=16,Dc=128,S=256)           max=1.676381e-08  mean=1.827601e-09  PASS
+
+
+===============================
+  Running MoE benchmark
+===============================
+./build/bench_moe
+=== MoE Naive Kernel Benchmark ===
+    warmup=10  iters=50
+
+  Config                         Min(ms)  Mean(ms)   Med(ms)   Max(ms)         Tok/s
+  ------------------------------------------------------------------------------------------------
+  T=16,E=4,K=2,D=64,I=128          0.188     0.196     0.192     0.225         81614
+  T=32,E=8,K=2,D=128,I=256         0.542     0.594     0.545     1.390         53905
+  T=64,E=8,K=2,D=256,I=512         1.688     1.704     1.704     1.719         37554
+  T=128,E=8,K=2,D=256,I=512        3.053     3.069     3.067     3.109         41710
+  T=64,E=8,K=4,D=256,I=512         3.037     3.046     3.045     3.059         21014
+  T=128,E=16,K=2,D=512,I=1024      9.850     9.981     9.935    10.723         12824
+
+
+===============================
+  Running DSA benchmark
+===============================
+./build/bench_dsa
+=== DSA Naive Kernel Benchmark ===
+    warmup=10  iters=50
+
+  Config                                     Min(ms)  Mean(ms)   Med(ms)   Max(ms)           Q/s
+  ------------------------------------------------------------------------------------------------------------
+  Q=4,H=4,Dc=64,Dp=16,S=64,N=256               0.040     0.042     0.043     0.047         94153
+  Q=8,H=8,Dc=128,Dp=32,S=128,N=512             0.096     0.098     0.098     0.102         81760
+  Q=16,H=8,Dc=128,Dp=32,S=256,N=1024           0.328     0.365     0.355     0.589         43832
+  Q=8,H=16,Dc=256,Dp=64,S=256,N=2048           0.432     0.448     0.437     0.781         17839
+  Q=4,H=16,Dc=512,Dp=64,S=512,N=4096           0.633     0.638     0.636     0.681          6272
+  Q=8,H=16,Dc=512,Dp=64,S=1024,N=8192          2.143     2.210     2.162     4.510          3619
+
+
+
+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

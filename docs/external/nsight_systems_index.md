@@ -1,0 +1,141 @@
+# Nsight Systems User Guide — Distilled Index
+
+This is an auto-generated table of contents for the Nsight Systems User Guide HTML file. Use this file to locate relevant CLI flags, container profiling advice, and CUDA tracing logic.
+
+- User Guide
+  - Preparing Your Application for Profiling
+    - Focused Profiling
+    - Marking and Labeling Regions
+  - Profiling from the CLI
+    - Installing the CLI on Your Target
+    - Command Line Options
+    - CLI Command Switches
+    - Example Single Command Lines
+    - Example Interactive CLI Command Sequences
+    - Example Stats Command Sequences
+    - Example Output from --stats Option
+    - System Wide API Trace on Windows
+    - Symbol Locations on Linux and QNX
+    - Opening Command Line Results Files for Visualization
+    - Handling Application Launchers (mpirun, deepspeed, etc)
+  - Profiling from the GUI
+    - Profiling Linux Targets from the GUI
+    - Profiling Windows Targets from the GUI
+    - Profiling QNX Targets from the GUI
+    - Nsight Streamer for Nsight Systems
+    - GUI VNC container
+  - Profiling within JupyterLab
+  - Container, Scheduler, and Cloud Support
+    - Collecting Data Within a Container
+    - Profiling Services in the Cloud
+  - Custom ETW Trace
+  - Direct3D Trace
+    - D3D11 API trace
+    - D3D12 API Trace
+  - WDDM Queues
+  - WDDM HW Scheduler
+  - Vulkan API Trace
+    - Vulkan Overview
+    - Pipeline Creation Feedback
+    - Vulkan GPU Trace Notes
+  - Stutter Analysis
+    - FPS Overview
+    - Frame Health
+    - Windows GPU Memory Utilization
+    - Vertical Synchronization
+  - CUDA Trace
+    - Basic CUDA trace
+    - Launching NVIDIA Nsight Compute from a CUDA Kernel
+    - CUDA GPU Memory Allocation Graph
+    - Unified Memory Transfer Trace
+    - CUDA Graph Trace
+    - CUDA Event Trace
+    - CUDA Python Backtrace
+    - CUDA Functions Skipped by Default
+    - cuDNN Function List for X86 CLI
+  - OpenMP Trace
+  - OS Runtime Libraries Trace
+    - Locking a Resource
+    - Limitations
+    - OS Runtime Libraries Trace Filters
+    - OS Runtime Default Function List
+  - Syscall Trace
+  - NVTX Trace
+  - OpenACC Trace
+  - OpenGL Trace
+    - OpenGL Trace Using Command Line
+  - OpenXR API Trace
+  - GPU Hardware Profiling
+    - GPU Context Switch
+    - GPU Metrics
+    - NVML power and temperature metrics
+  - SoC Metrics
+    - Overview
+    - Available metrics
+    - Launching SoC Metrics from the CLI
+    - Launching SoC Metrics from the GUI
+  - CPU Profiling on Linux
+    - Features
+    - System Requirements
+    - Configuring a CPU Profiling Collection
+    - Visualizing CPU Profiling Results
+    - CPU Event Counters/Core Metrics
+    - Common Issues
+  - NVIDIA Video Profiling
+    - NVIDIA Video Hardware Profiling
+    - NVIDIA Video Codec SDK Trace
+  - Network Communication Profiling
+    - MPI API Trace
+    - OpenSHMEM Library Trace
+    - UCX API Trace
+    - NVIDIA NCCL Trace
+    - NVIDIA NVSHMEM Trace
+  - Network Hardware Profiling
+    - InfiniBand Network Information
+    - Network Interface Controller (NIC) Profiling
+    - Network Switch Profiling
+    - Network Interface Device Profiling
+  - Network Storage Profiling
+    - NFS volumes counters
+    - Lustre volumes counters
+    - Local and NVMe-oF volumes counters
+    - S3 Trace
+    - GDS (GPUDirect Storage) Trace
+    - GDS (GPUDirect Storage) Counters
+  - Python Profiling
+    - Python Backtrace Sampling
+    - Python Functions Trace
+    - Python GIL Tracing
+    - PyTorch Profiling
+    - Dask Profiling
+  - Profiling with DRIVE Hypervisor
+  - Adding Your Own Collection to a Report
+    - Nsight Systems Plugins
+    - Developing an Nsight Systems Plugin
+    - Import NVTXT
+  - Reading Your Report in GUI
+    - Generating a New Report
+    - Opening an Existing Report
+    - Sharing a Report File
+    - Report Tab
+    - Analysis Summary View
+    - Diagnostics Summary View
+    - Symbol Resolution Logs View
+    - Timeline View
+    - Events View
+    - Multi-Report Timeline Views
+    - Add-on Graphs - Flame Graph
+  - Visual Studio Integration
+  - Troubleshooting
+    - General Troubleshooting
+    - CLI Troubleshooting
+    - Launch Processes in Stopped State
+    - GUI Troubleshooting
+    - Symbol Resolution
+    - Logging
+  - Other Resources
+    - Training Seminars
+    - Blog Posts
+    - Feature Videos
+    - Conference Presentations
+    - For More Support
