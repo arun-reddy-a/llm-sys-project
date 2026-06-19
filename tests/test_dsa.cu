@@ -153,6 +153,70 @@ static bool run_test(const char* name, const DsaConfig& cfg, float tol) {
     return pass;
 }
 
+// Opt 8 uses FP16 WMMA for scores — compare against CPU with a looser tolerance.
+static bool run_test_opt8(const char* name, const DsaConfig& cfg, float tol) {
+    printf("  %-40s  ", name);
+
+    int Q  = cfg.num_queries;
+    int H  = cfg.num_heads;
+    int Dc = cfg.head_dim_compressed;
+    int Dp = cfg.head_dim_positional;
+    int S  = cfg.num_selected_kv;
+    int N  = cfg.total_kv_tokens;
+
+    srand(42);
+
+    std::vector<float> h_q_nope(Q * H * Dc);
+    std::vector<float> h_q_pe(Q * H * Dp);
+    std::vector<float> h_kv_c(N * Dc);
+    std::vector<float> h_kv_p(N * Dp);
+    std::vector<float> h_v(N * Dc);
+    std::vector<int>   h_idx(Q * S);
+
+    random_fill(h_q_nope.data(), Q * H * Dc, -0.3f, 0.3f);
+    random_fill(h_q_pe.data(),   Q * H * Dp, -0.3f, 0.3f);
+    random_fill(h_kv_c.data(),   N * Dc, -0.3f, 0.3f);
+    random_fill(h_kv_p.data(),   N * Dp, -0.3f, 0.3f);
+    random_fill(h_v.data(),      N * Dc, -0.3f, 0.3f);
+    gen_sparse_indices(h_idx.data(), Q, S, N);
+
+    std::vector<float> cpu_out(Q * H * Dc, 0.0f);
+    cpu_dsa_forward(h_q_nope.data(), h_q_pe.data(),
+                    h_kv_c.data(), h_kv_p.data(), h_v.data(),
+                    h_idx.data(), cpu_out.data(), cfg);
+
+    DeviceBuf<float> d_q_nope(Q * H * Dc);
+    DeviceBuf<float> d_q_pe(Q * H * Dp);
+    DeviceBuf<float> d_kv_c(N * Dc);
+    DeviceBuf<float> d_kv_p(N * Dp);
+    DeviceBuf<float> d_v(N * Dc);
+    DeviceBuf<int>   d_idx(Q * S);
+    DeviceBuf<float> d_output(Q * H * Dc);
+
+    d_q_nope.upload(h_q_nope.data());
+    d_q_pe.upload(h_q_pe.data());
+    d_kv_c.upload(h_kv_c.data());
+    d_kv_p.upload(h_kv_p.data());
+    d_v.upload(h_v.data());
+    d_idx.upload(h_idx.data());
+
+    dsa_forward_opt8(d_q_nope.ptr, d_q_pe.ptr,
+                     d_kv_c.ptr, d_kv_p.ptr, d_v.ptr,
+                     d_idx.ptr, d_output.ptr, cfg);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<float> h_output(Q * H * Dc);
+    d_output.download(h_output.data());
+
+    float max_err  = max_abs_error(cpu_out.data(), h_output.data(), Q * H * Dc);
+    float mean_err = mean_abs_error(cpu_out.data(), h_output.data(), Q * H * Dc);
+
+    bool pass = max_err < tol;
+    printf("max=%.6e  mean=%.6e  %s\n", max_err, mean_err,
+           pass ? "PASS" : "FAIL");
+    return pass;
+}
+
 int main() {
     printf("=== DSA Correctness Tests ===\n\n");
 
@@ -227,6 +291,24 @@ int main() {
     {
         DsaConfig cfg = {16, 16, 128, 32, 256, 64, 2048};
         total++; if (run_test("stress (Q=16,H=16,Dc=128,S=256)", cfg, 5e-2f)) passed++;
+    }
+
+    printf("\n--- Opt8 (FP16 WMMA scores + float4 KV/V; looser vs CPU FP32) ---\n");
+    {
+        DsaConfig cfg = {2, 2, 32, 8, 16, 8, 64};
+        total++; if (run_test_opt8("opt8 tiny   (Q=2,H=2,Dc=32,S=16)", cfg, 2e-2f)) passed++;
+    }
+    {
+        DsaConfig cfg = {4, 4, 64, 16, 64, 16, 256};
+        total++; if (run_test_opt8("opt8 small  (Q=4,H=4,Dc=64,S=64)", cfg, 3e-2f)) passed++;
+    }
+    {
+        DsaConfig cfg = {8, 8, 128, 32, 128, 32, 512};
+        total++; if (run_test_opt8("opt8 medium (Q=8,H=8,Dc=128,S=128)", cfg, 8e-2f)) passed++;
+    }
+    {
+        DsaConfig cfg = {4, 4, 128, 32, 256, 64, 1024};
+        total++; if (run_test_opt8("opt8 large  (Q=4,H=4,Dc=128,S=256)", cfg, 0.12f)) passed++;
     }
 
     printf("\nResults: %d / %d passed\n", passed, total);

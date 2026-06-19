@@ -68,9 +68,17 @@ void dsa_output_proj(const float* attn, const float* v, float* output,
                      const DsaConfig& cfg, cudaStream_t stream = 0);
 
 // ---------------------------------------------------------------------------
-// Full naive DSA forward pass (host-side orchestrator)
+// Online softmax + output (FlashAttention-style, used by Opt4+)
 // ---------------------------------------------------------------------------
+void dsa_online_softmax_output(const float* scaled_scores, const float* v,
+                               float* output,
+                               const DsaConfig& cfg, cudaStream_t stream = 0);
 
+// ---------------------------------------------------------------------------
+// DSA Forward Implementations  (Naive + Opt1–Opt8)
+// ---------------------------------------------------------------------------
+//
+// All variants share the same signature:
 //   q_nope               [Q, H, Dc]
 //   q_pe                 [Q, H, Dp]
 //   kv_cache_compressed  [N, Dc]
@@ -78,6 +86,91 @@ void dsa_output_proj(const float* attn, const float* v, float* output,
 //   v_cache              [N, Dc]
 //   sparse_indices       [Q, S]
 //   output               [Q, H, Dc]
+
+// NAIVE: Gather → naive per-element dots → 3-pass softmax → naive output proj
+void dsa_forward_naive(const float* q_nope, const float* q_pe,
+                       const float* kv_cache_compressed,
+                       const float* kv_cache_positional,
+                       const float* v_cache,
+                       const int* sparse_indices,
+                       float* output,
+                       const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 1: Shared-memory tiled dot products (reuse kc/kp tile across heads)
+void dsa_forward_opt1(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 2: Fuse two dots into single GEMM (Dc+Dp in one tiled pass)
+void dsa_forward_opt2(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 3: Batch across queries (fused batched GEMM + batched output proj)
+void dsa_forward_opt3(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 4: FlashAttention-style online softmax + output fusion
+void dsa_forward_opt4(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 5: Sort sparse indices by page for coalesced KV access
+void dsa_forward_opt5(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 6: Fuse KV gather into compute (sparse-index-driven, no separate gather)
+void dsa_forward_opt6(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 7: Asynchronous L2 KV tile prefetching
+void dsa_forward_opt7(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// OPT 8: FP16 tensor cores (WMMA) for score GEMM, 64×64 GEMM tiles,
+//         float4 vectorized global loads where contiguous (Opt 10), plus
+//         float4 V loads in fused online softmax (Opt 10) and L2 prefetch (Opt 7).
+void dsa_forward_opt8(const float* q_nope, const float* q_pe,
+                      const float* kv_cache_compressed,
+                      const float* kv_cache_positional,
+                      const float* v_cache,
+                      const int* sparse_indices,
+                      float* output,
+                      const DsaConfig& cfg, cudaStream_t stream = 0);
+
+// Default: delegates to Opt8 (fastest inlined variant in this file).
 void dsa_forward(const float* q_nope, const float* q_pe,
                  const float* kv_cache_compressed,
                  const float* kv_cache_positional,
